@@ -120,11 +120,12 @@ function loadDomTestConfig(env = {}) {
   const childEnv = { ...process.env };
   delete childEnv.VITEST_MAX_THREADS;
   Object.assign(childEnv, env);
-  const out = execFileSync(join(REPO_ROOT, 'node_modules', '.bin', 'tsx'), [probe], {
+  const out = execFileSync(process.execPath, ['--import', 'tsx', probe], {
     cwd: REPO_ROOT,
     encoding: 'utf8',
     env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 30_000,
   });
   return JSON.parse(out.trim().split('\n').at(-1));
 }

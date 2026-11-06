@@ -7,7 +7,7 @@
   "totalTolerancePct": 0.25,
   "totalToleranceBytes": 16384,
   "total": {
-    "raw": 458666
+    "raw": 459254
   },
   "chunks": {
     "analytics": {
@@ -59,7 +59,7 @@
       "files": 1
     },
     "main": {
-      "raw": 134857,
+      "raw": 134942,
       "files": 1
     },
     "map-layer-definitions": {
@@ -67,7 +67,7 @@
       "files": 1
     },
     "panels": {
-      "raw": 37755,
+      "raw": 37821,
       "files": 1
     },
     "runtime-config": {
@@ -76,6 +76,10 @@
     },
     "safe-storage": {
       "raw": 1212,
+      "files": 1
+    },
+    "self-host-runtime": {
+      "raw": 395,
       "files": 1
     },
     "sensitive-url-params": {
@@ -91,7 +95,7 @@
       "files": 1
     },
     "theme-colors": {
-      "raw": 71681,
+      "raw": 71723,
       "files": 1
     },
     "theme-manager": {
@@ -109,11 +113,11 @@
   },
   "deferred": {
     "total": {
-      "raw": 1510178
+      "raw": 1512897
     },
     "chunks": {
       "App": {
-        "raw": 955677,
+        "raw": 958061,
         "files": 1
       },
       "ai-flow-settings": {
@@ -121,7 +125,7 @@
         "files": 1
       },
       "analysis-framework-store": {
-        "raw": 9788,
+        "raw": 9828,
         "files": 1
       },
       "audience-profile": {
@@ -137,7 +141,7 @@
         "files": 1
       },
       "checkout": {
-        "raw": 14947,
+        "raw": 14987,
         "files": 1
       },
       "cloud-prefs-sync": {
@@ -169,7 +173,7 @@
         "files": 1
       },
       "gdelt-intel": {
-        "raw": 122936,
+        "raw": 123024,
         "files": 1
       },
       "index": {
@@ -193,7 +197,7 @@
         "files": 1
       },
       "panel-gating": {
-        "raw": 4219,
+        "raw": 4276,
         "files": 1
       },
       "panel-storage": {
@@ -213,7 +217,7 @@
         "files": 1
       },
       "settings-persistence": {
-        "raw": 7959,
+        "raw": 8010,
         "files": 1
       },
       "source-provenance": {
@@ -237,7 +241,7 @@
         "files": 1
       },
       "widget-store": {
-        "raw": 27968,
+        "raw": 28027,
         "files": 1
       }
     }
