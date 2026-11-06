@@ -4,11 +4,14 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { load as loadYaml } from 'js-yaml';
+
+import { discoverProtoServiceNames, loadUnifiedOpenApiSpec } from './_lib/openapi-spec-cache.mjs';
 import {
   readPublicNoAuthPaths,
   readEndpointEntitlements,
   readPremiumRpcPaths,
   PUBLIC_FORBIDDEN_GATES,
+  TRUST_REVIEW_KEY_PATHS,
 } from '../scripts/lib/openapi-codegen.mjs';
 
 // Guards the API contracts injected by the OpenAPI post-generation scripts:
@@ -18,6 +21,20 @@ import {
 // assertions fail and flag the drop.
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const COUNTRY_HISTORY_PATH = '/api/intelligence/v1/get-country-history';
+
+it('country history publishes anonymous, API-key and bearer alternatives with 401 only for supplied credentials', () => {
+  const specs = [
+    JSON.parse(readFileSync(resolve(root, 'docs/api/IntelligenceService.openapi.json'), 'utf8')),
+    loadYaml(readFileSync(resolve(root, 'docs/api/IntelligenceService.openapi.yaml'), 'utf8')),
+    loadYaml(readFileSync(resolve(root, 'docs/api/worldmonitor.openapi.yaml'), 'utf8')),
+  ];
+  for (const spec of specs) {
+    const op = spec.paths[COUNTRY_HISTORY_PATH].get;
+    assert.deepEqual(op.security, [{}, { WorldMonitorKey: [] }, { ApiKeyHeader: [] }, { BearerAuth: [] }]);
+    assert.match(op.responses['401'].description, /Invalid supplied credentials/);
+  }
+});
 const apiDir = resolve(root, 'docs/api');
 const protoWorldmonitorDir = resolve(root, 'proto/worldmonitor');
 
@@ -27,7 +44,7 @@ const protoWorldmonitorDir = resolve(root, 'proto/worldmonitor');
 // values catches any regenerate that drops an injection.
 const PUBLIC_PATHS = readPublicNoAuthPaths();
 const ENDPOINT_ENTITLEMENTS = readEndpointEntitlements();
-const BEARER_AUTH_PATHS = new Set([...ENDPOINT_ENTITLEMENTS.keys(), ...readPremiumRpcPaths()]);
+const BEARER_AUTH_PATHS = new Set([...ENDPOINT_ENTITLEMENTS.keys(), ...readPremiumRpcPaths(), COUNTRY_HISTORY_PATH]);
 // Legacy-Pro-gated paths NOT covered by the newer ENDPOINT_ENTITLEMENTS tier
 // map. These carry a "Pro subscription required" 403 (gateway
 // needsLegacyProBearerGate). Entitlement paths are subtracted so the stricter
@@ -47,6 +64,7 @@ const API_KEY_SCHEMES = {
   ApiKeyHeader: { type: 'apiKey', in: 'header', name: 'X-Api-Key' },
 };
 const BEARER_SCHEME = { BearerAuth: { type: 'http', scheme: 'bearer' } };
+const TRUST_REVIEW_SCHEME = { TrustReviewKey: { type: 'apiKey', in: 'header', name: 'X-Trust-Review-Key' } };
 const API_KEY_SECURITY_NAMES = Object.keys(API_KEY_SCHEMES);
 const BEARER_SECURITY_NAMES = [...API_KEY_SECURITY_NAMES, 'BearerAuth'];
 
@@ -56,8 +74,29 @@ const serviceSpecs = readdirSync(apiDir)
 const protoRequiredRequestFields = readProtoRequiredRequestFields();
 
 function expectedSchemesForSpec(spec) {
-  const hasBearerAuthPath = Object.keys(spec.paths ?? {}).some((path) => BEARER_AUTH_PATHS.has(path));
-  return hasBearerAuthPath ? { ...API_KEY_SCHEMES, ...BEARER_SCHEME } : API_KEY_SCHEMES;
+  const paths = Object.keys(spec.paths ?? {});
+  const hasBearerAuthPath = paths.some((path) => BEARER_AUTH_PATHS.has(path));
+  const hasTrustReviewPath = paths.some((path) => TRUST_REVIEW_KEY_PATHS.has(path));
+  return {
+    ...API_KEY_SCHEMES,
+    ...(hasBearerAuthPath ? BEARER_SCHEME : {}),
+    ...(hasTrustReviewPath ? TRUST_REVIEW_SCHEME : {}),
+  };
+}
+
+// Operator review routes (#9192) skip the gateway key check but 401 in the
+// handler without X-Trust-Review-Key: they declare that key alone, a 401 with
+// the handler's `{ message }` body, and no account-state 403.
+function assertTrustReviewOperation(op, opLabel) {
+  assertSecurityNames(op.security, ['TrustReviewKey'], opLabel);
+  const r401 = op.responses?.['401'];
+  assert.ok(r401, `${opLabel}: review-key op must carry a 401`);
+  assert.equal(
+    r401.content?.['application/json']?.schema?.$ref,
+    '#/components/schemas/Error',
+    `${opLabel}: review-key 401 must reference Error (the handler's { message } body)`,
+  );
+  assert.equal(op.responses?.['403'], undefined, `${opLabel}: review-key op must not carry a 403`);
 }
 
 function securityNames(security) {
@@ -377,12 +416,19 @@ function assertAuthContract(spec, label) {
     for (const [method, op] of Object.entries(ops)) {
       if (!HTTP_METHODS.has(method) || !op || typeof op !== 'object') continue;
       const opLabel = `${label}: ${method.toUpperCase()} ${path}`;
+      if (TRUST_REVIEW_KEY_PATHS.has(path)) {
+        assertTrustReviewOperation(op, opLabel);
+        continue;
+      }
       if (isPublic) {
         assert.ok(
           Array.isArray(op.security) && op.security.length === 0,
           `${opLabel}: public op must set security: [] (opt out of auth)`,
         );
         assert.equal(op.responses?.['401'], undefined, `${opLabel}: public op must not carry a 401`);
+        if (!PUBLIC_FORBIDDEN_GATES.has(path)) {
+          assert.equal(op.responses?.['403'], undefined, `${opLabel}: public op without a declared gate must not carry a 403`);
+        }
         continue;
       }
       const r401 = op.responses?.['401'];
@@ -392,7 +438,9 @@ function assertAuthContract(spec, label) {
         '#/components/schemas/UnauthorizedError',
         `${opLabel}: 401 must reference UnauthorizedError`,
       );
-      if (acceptsBearer) {
+      if (path === COUNTRY_HISTORY_PATH) {
+        assert.deepEqual(op.security, [{}, { WorldMonitorKey: [] }, { ApiKeyHeader: [] }, { BearerAuth: [] }]);
+      } else if (acceptsBearer) {
         assertSecurityNames(op.security, BEARER_SECURITY_NAMES, opLabel);
       } else {
         assert.equal(op.security, undefined, `${opLabel}: should inherit API-key root security`);
@@ -411,21 +459,66 @@ function assertAuthContract(spec, label) {
 }
 
 describe('OpenAPI security contract', () => {
-  it('audits at least the full known service surface', () => {
-    assert.ok(serviceSpecs.length >= 34, `expected >= 34 service specs, found ${serviceSpecs.length}`);
+  it('reads every public route from the gateway Set, comments included', () => {
+    // An apostrophe in a comment inside the Set once paired with the next quote,
+    // so later routes parsed as comment text and lost their `security: []`.
+    const gateway = readFileSync(resolve(root, 'server/gateway.ts'), 'utf8');
+    const block = gateway.match(/PUBLIC_NO_AUTH_RPC_PATHS\s*=\s*new Set<string>\(\[([\s\S]*?)\]\)/)[1];
+    const declared = [...block.matchAll(/^\s*'(\/api\/[^']+)',?\s*$/gm)].map((m) => m[1]);
+    assert.ok(declared.length > 0);
+    assert.deepEqual([...PUBLIC_PATHS].sort(), [...new Set(declared)].sort());
+  });
+
+  it('audits the complete proto service surface', () => {
+    assert.deepEqual(
+      serviceSpecs.map((file) => file.replace(/\.openapi\.json$/, '')),
+      discoverProtoServiceNames(),
+      'security specs must match the proto service universe exactly',
+    );
   });
 
   it('parses the bearer-auth and entitlement path sources from gateway-adjacent code', () => {
     assert.ok(BEARER_AUTH_PATHS.size > 0, 'expected at least one bearer-auth path');
     assert.ok(ENDPOINT_ENTITLEMENTS.size >= 18, 'expected issue-scoped entitlement-gated paths');
     assert.equal(ENDPOINT_ENTITLEMENTS.get('/api/market/v1/analyze-stock'), 1, 'expected tier-gated market path');
-    assert.equal(ENDPOINT_ENTITLEMENTS.get('/api/sanctions/v1/list-sanctions-pressure'), 1, 'expected sanctions pressure path');
+    assert.equal(ENDPOINT_ENTITLEMENTS.get('/api/economic/v1/list-global-tenders'), 1, 'expected procurement path');
+    assert.ok(!BEARER_AUTH_PATHS.has('/api/sanctions/v1/list-sanctions-pressure'), 'sanctions pressure is free (served by public bootstrap)');
     assert.equal(ENDPOINT_ENTITLEMENTS.get('/api/trade/v1/list-comtrade-flows'), 1, 'expected Comtrade path');
     assert.ok(PUBLIC_FORBIDDEN_GATES.has('/api/leads/v1/submit-contact'), 'expected Leads Turnstile 403 path');
     assert.ok(PUBLIC_FORBIDDEN_GATES.has('/api/leads/v1/register-interest'), 'expected Leads register-interest 403 gate');
     assert.ok(BEARER_AUTH_PATHS.has('/api/intelligence/v1/get-regional-brief'), 'expected legacy premium path');
     assert.ok(PREMIUM_ONLY_PATHS.has('/api/intelligence/v1/get-regional-brief'), 'expected legacy premium-only path (not entitlement-gated)');
     assert.ok(!PREMIUM_ONLY_PATHS.has('/api/market/v1/analyze-stock'), 'entitlement-gated path must not be treated as premium-only');
+  });
+
+  it('declares the review key on exactly the operations whose handler requires it', () => {
+    // The gateway must let these through without an API key, or the review key
+    // could never be the whole credential.
+    for (const path of TRUST_REVIEW_KEY_PATHS) {
+      assert.ok(PUBLIC_PATHS.has(path), `${path} must be in PUBLIC_NO_AUTH_RPC_PATHS`);
+      assert.ok(!BEARER_AUTH_PATHS.has(path), `${path} must not accept bearer auth`);
+      assert.ok(!PUBLIC_FORBIDDEN_GATES.has(path), `${path} must not carry a public 403 gate`);
+    }
+    // The proto comments name the header on every review-key RPC; a new one
+    // without a TRUST_REVIEW_KEY_PATHS entry would publish `security: []`.
+    const documented = new Set();
+    for (const file of serviceSpecs) {
+      const spec = JSON.parse(readFileSync(resolve(apiDir, file), 'utf8'));
+      for (const [path, ops] of Object.entries(spec.paths ?? {})) {
+        for (const [method, op] of Object.entries(ops)) {
+          if (!HTTP_METHODS.has(method) || !op || typeof op !== 'object') continue;
+          if (String(op.description ?? '').includes('X-Trust-Review-Key')) documented.add(path);
+        }
+      }
+    }
+    assert.deepEqual([...documented].sort(), [...TRUST_REVIEW_KEY_PATHS].sort());
+    // A handler that gates on isTrustReviewer without the proto comment would
+    // slip past the check above; one review-key path per call site.
+    const handlerDir = resolve(root, 'server/worldmonitor');
+    const callSites = readdirSync(handlerDir, { recursive: true })
+      .filter((file) => file.endsWith('.ts'))
+      .flatMap((file) => [...readFileSync(resolve(handlerDir, file), 'utf8').matchAll(/\bisTrustReviewer\(/g)]);
+    assert.equal(callSites.length, TRUST_REVIEW_KEY_PATHS.size, 'each isTrustReviewer handler needs a TRUST_REVIEW_KEY_PATHS entry');
   });
 
   for (const file of serviceSpecs) {
@@ -479,6 +572,10 @@ describe('OpenAPI security contract', () => {
           for (const [method, op] of Object.entries(ops)) {
             if (!HTTP_METHODS.has(method) || !op || typeof op !== 'object') continue;
             const label = `${method.toUpperCase()} ${path}`;
+            if (TRUST_REVIEW_KEY_PATHS.has(path)) {
+              assertTrustReviewOperation(op, `${file}: ${label}`);
+              continue;
+            }
             if (isPublic) {
               assert.ok(
                 Array.isArray(op.security) && op.security.length === 0,
@@ -496,7 +593,9 @@ describe('OpenAPI security contract', () => {
               `${file}: ${label} 401 must reference UnauthorizedError`,
             );
 
-            if (acceptsBearer) {
+            if (path === COUNTRY_HISTORY_PATH) {
+              assert.deepEqual(op.security, [{}, { WorldMonitorKey: [] }, { ApiKeyHeader: [] }, { BearerAuth: [] }]);
+            } else if (acceptsBearer) {
               assertSecurityNames(op.security, BEARER_SECURITY_NAMES, `${file}: ${label}`);
             } else {
               assert.equal(op.security, undefined, `${file}: ${label} should inherit API-key root security`);
@@ -526,14 +625,14 @@ describe('OpenAPI security contract', () => {
       assertPublicForbiddenGateContract(spec, file);
       assertPremiumForbiddenGateContract(spec, file);
     }
-    const bundle = loadYaml(readFileSync(resolve(apiDir, 'worldmonitor.openapi.yaml'), 'utf8'));
+    const bundle = loadUnifiedOpenApiSpec();
     assertEntitlementOperationContract(bundle, 'bundle');
     assertPremiumForbiddenGateContract(bundle, 'bundle');
     assertPublicForbiddenGateContract(bundle, 'bundle');
   });
 
   it('keeps gated operation descriptions byte-identical across JSON, YAML, and bundle', () => {
-    const bundle = loadYaml(readFileSync(resolve(apiDir, 'worldmonitor.openapi.yaml'), 'utf8'));
+    const bundle = loadUnifiedOpenApiSpec();
     const failures = [];
     for (const file of serviceSpecs) {
       const jsonSpec = JSON.parse(readFileSync(resolve(apiDir, file), 'utf8'));
@@ -553,7 +652,7 @@ describe('OpenAPI security contract', () => {
   });
 
   it('bundle (worldmonitor.openapi.yaml) carries the full auth contract', () => {
-    const bundle = loadYaml(readFileSync(resolve(apiDir, 'worldmonitor.openapi.yaml'), 'utf8'));
+    const bundle = loadUnifiedOpenApiSpec();
     assertAuthContract(bundle, 'bundle');
   });
 
@@ -568,7 +667,7 @@ describe('OpenAPI security contract', () => {
       failures.push(...queryRequiredContradictions(yamlSpec, yamlFile));
     }
 
-    const bundle = loadYaml(readFileSync(resolve(apiDir, 'worldmonitor.openapi.yaml'), 'utf8'));
+    const bundle = loadUnifiedOpenApiSpec();
     failures.push(...queryRequiredContradictions(bundle, 'worldmonitor.openapi.yaml'));
 
     assert.deepEqual(failures, []);
@@ -586,7 +685,7 @@ describe('OpenAPI security contract', () => {
     }
     specs.push({
       label: 'worldmonitor.openapi.yaml',
-      spec: loadYaml(readFileSync(resolve(apiDir, 'worldmonitor.openapi.yaml'), 'utf8')),
+      spec: loadUnifiedOpenApiSpec(),
     });
 
     const failures = [];
@@ -641,7 +740,7 @@ describe('OpenAPI security contract', () => {
     const yamlSpec = loadYaml(readFileSync(resolve(apiDir, 'LeadsService.openapi.yaml'), 'utf8'));
     assertSchemaRequires(yamlSpec, 'RegisterInterestRequest', fields, 'LeadsService.openapi.yaml');
 
-    const bundle = loadYaml(readFileSync(resolve(apiDir, 'worldmonitor.openapi.yaml'), 'utf8'));
+    const bundle = loadUnifiedOpenApiSpec();
     const matches = matchingRequestSchemas(bundle, 'RegisterInterestRequest');
     assert.equal(matches.length, 1, 'worldmonitor.openapi.yaml: expected one RegisterInterestRequest schema');
     const [[schemaName, schema]] = matches;

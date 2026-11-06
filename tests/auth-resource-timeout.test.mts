@@ -4,6 +4,26 @@ import test from 'node:test';
 const never = <T>(): Promise<T> => new Promise<T>(() => {});
 const after = <T>(ms: number, value: T): Promise<T> => new Promise((resolve) => setTimeout(() => resolve(value), ms));
 
+/**
+ * Deadlock detector, not a latency budget.
+ *
+ * These tests stub a fetch that never resolves (or resolves later than the
+ * code's own abort timer), so a promise that settles AT ALL proves the timeout
+ * fired — the elapsed time proves nothing extra. Racing a tight millisecond
+ * budget instead measured the runner's load and flaked on a busy CI box while
+ * passing in isolation. The deadline here only exists so a genuine hang fails
+ * this test rather than stalling the whole suite; the assertions that follow
+ * each call are what pin the timeout behaviour.
+ */
+const HANG_DEADLINE_MS = 15_000;
+
+async function settlesWithoutHanging<T>(work: Promise<T>, label: string): Promise<T> {
+  const pending = Symbol('pending');
+  const outcome = await Promise.race([work, after(HANG_DEADLINE_MS, pending)]);
+  assert.notEqual(outcome, pending, `${label} never settled — the abort path did not fire`);
+  return outcome as T;
+}
+
 // Captured at module load, before any test swaps globalThis.fetch for a stub.
 // The Clerk plan-lookup test needs a working fetch for its local JWKS server.
 const realFetch = globalThis.fetch;
@@ -115,11 +135,16 @@ test('widget-agent request-body read must terminate for a body that never ends',
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (() => never<Response>()) as typeof fetch;
   try {
-    const { default: handler } = await import('../api/widget-agent.ts?resource-repro=1');
+    const { default: handler, __setWidgetAgentSpendDepsForTests } = await import('../api/widget-agent.ts?resource-repro=1');
+    __setWidgetAgentSpendDepsForTests({
+      checkRateLimit: async () => null,
+    });
+    let cancelled = false;
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new TextEncoder().encode('{"prompt":"'));
       },
+      cancel() { cancelled = true; },
     });
     const req = new Request('https://www.worldmonitor.app/api/widget-agent', {
       method: 'POST',
@@ -133,17 +158,18 @@ test('widget-agent request-body read must terminate for a body that never ends',
     } as RequestInit & { duplex: 'half' });
 
     const outcome = await Promise.race([
-      handler(req).then(() => 'settled'),
+      handler(req).then((res) => { assert.equal(res.status, 408); return 'settled'; }),
       after(500, 'still-pending'),
     ]);
     assert.equal(outcome, 'settled');
+    assert.equal(cancelled, true);
   } finally {
     globalThis.fetch = originalFetch;
     delete process.env.WIDGET_AGENT_BODY_TIMEOUT_MS;
   }
 });
 
-test('__resetWmSessionForTests restores the default mint timeout', async () => {
+test('__resetWmSessionForTests restores the default mint timeout', async (t) => {
   (globalThis as unknown as { window: unknown }).window = globalThis;
   (globalThis as unknown as { location: Location }).location = {
     href: 'https://worldmonitor.app/',
@@ -158,24 +184,24 @@ test('__resetWmSessionForTests restores the default mint timeout', async () => {
     visibilityState: 'visible',
     addEventListener() {},
   };
-  (globalThis as unknown as { fetch: typeof fetch }).fetch = ((_input, init) => new Promise<Response>((resolve, reject) => {
-    if (init?.signal?.aborted) {
-      reject(new Error('Aborted'));
-      return;
-    }
-    init?.signal?.addEventListener('abort', () => reject(new Error('Aborted')), { once: true });
-    setTimeout(() => resolve(new Response(JSON.stringify({ exp: Date.now() + 3600000 }))), 100);
-  })) as typeof fetch;
+  let mintCalls = 0;
+  globalThis.fetch = async () => {
+    mintCalls += 1;
+    return new Response(JSON.stringify({ exp: Date.now() + 3600000 }));
+  };
 
   const mod = await import('../src/services/wm-session.ts?reset-timeout-repro=1');
+  mod.__resetWmSessionForTests();
+  const timeout = t.mock.method(globalThis, 'setTimeout');
   mod.__setWmSessionFetchTimeoutForTests(50);
+  assert.equal(await mod.ensureWmSession(), true);
+  assert.deepEqual(timeout.mock.calls.map((call) => call.arguments[1]), [50]);
   mod.__resetWmSessionForTests();
 
-  const outcome = await Promise.race([
-    mod.ensureWmSession().then(() => 'settled'),
-    after(500, 'still-pending'),
-  ]);
-  assert.equal(outcome, 'settled');
+  assert.equal(await mod.ensureWmSession(), true);
+  assert.equal(mintCalls, 2, 'reset must clear the successful mint cache');
+  assert.deepEqual(timeout.mock.calls.map((call) => call.arguments[1]), [50, 10_000]);
+  mod.__resetWmSessionForTests();
 });
 
 test('clerk plan lookup must not pin the gateway when Clerk never responds', async () => {
@@ -245,13 +271,12 @@ test('clerk plan lookup must not pin the gateway when Clerk never responds', asy
       .setExpirationTime('1h')
       .sign(privateKey);
 
-    const settled = await Promise.race([
+    // The Clerk stub never resolves, so validateBearerToken settling at all is
+    // the proof that CLERK_PLAN_LOOKUP_TIMEOUT_MS aborted the lookup.
+    const session = await settlesWithoutHanging(
       mod.validateBearerToken(token),
-      after(500, 'still-pending' as const),
-    ]);
-    assert.notEqual(settled, 'still-pending', 'a stalled Clerk plan lookup must not keep the request pending');
-
-    const session = settled as { valid: boolean; role?: string };
+      'validateBearerToken with a stalled Clerk plan lookup',
+    ) as { valid: boolean; role?: string };
     assert.equal(session.valid, true);
     assert.equal(session.role, 'free', 'a timed-out plan lookup degrades to free, exactly like an HTTP error');
     assert.equal(clerkCalls, 1);

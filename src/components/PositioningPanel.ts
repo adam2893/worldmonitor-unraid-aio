@@ -1,20 +1,12 @@
-import type { MarketServiceClient } from '@/generated/client/worldmonitor/market/v1/service_client';
 import type { HyperliquidAssetFlow } from '@/generated/client/worldmonitor/market/v1/service_client';
 import { Panel } from './Panel';
+import { createLazyClient, getRpcBaseUrl, rpcFetch } from '@/services/rpc-client';
+import { MarketServiceClient } from '@/services/generated-rpc-clients';
 import { t } from '@/services/i18n';
 import { escapeHtml, unsafeRawHtml } from '@/utils/sanitize';
 import { getHydratedData } from '@/services/bootstrap';
 
-let _client: MarketServiceClient | null = null;
-
-async function getMarketClient(): Promise<MarketServiceClient> {
-  if (!_client) {
-    const { MarketServiceClient } = await import('@/generated/client/worldmonitor/market/v1/service_client');
-    const { getRpcBaseUrl } = await import('@/services/rpc-client');
-    _client = new MarketServiceClient(getRpcBaseUrl(), { fetch: (...args: Parameters<typeof fetch>) => globalThis.fetch(...args) });
-  }
-  return _client;
-}
+const getMarketClient = createLazyClient(() => new MarketServiceClient(getRpcBaseUrl(), { fetch: rpcFetch }));
 
 interface AssetView {
   symbol: string;
@@ -120,7 +112,7 @@ function renderArcGauge(score: number, color: string, size = 56): string {
   return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" class="pos-gauge">
     <path d="M ${bgX1} ${bgY1} A ${r} ${r} 0 1 1 ${bgX2} ${bgY2}" fill="none" stroke="var(--border-color, #333)" stroke-width="3" stroke-linecap="round"/>
     ${score > 0 ? `<path d="M ${bgX1} ${bgY1} A ${r} ${r} 0 ${largeArc} 1 ${fX2} ${fY2}" fill="none" stroke="${color}" stroke-width="3.5" stroke-linecap="round" opacity="${opacity}"/>` : ''}
-    <text x="${cx}" y="${cy + 2}" text-anchor="middle" dominant-baseline="middle" fill="${color}" font-size="13" font-weight="600" opacity="${opacity}">${Math.round(score)}</text>
+    <text x="${cx}" y="${cy + 2}" text-anchor="middle" dominant-baseline="middle" fill="${color}" style="font-size:calc(13px * var(--wm-panel-effective-scale, 1))" font-weight="600" opacity="${opacity}">${Math.round(score)}</text>
   </svg>`;
 }
 
@@ -222,7 +214,7 @@ export class PositioningPanel extends Panel {
         }
       }
 
-      const client = await getMarketClient();
+      const client = getMarketClient();
       const resp = await client.getHyperliquidFlow({});
       if (resp.unavailable || !resp.assets || resp.assets.length === 0) {
         if (!this._flow) {

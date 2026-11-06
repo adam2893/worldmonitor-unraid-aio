@@ -3,9 +3,12 @@
 # Multi-stage build for the World Monitor web app (frontend only).
 
 # Stage 1: Build the frontend with TypeScript + Vite.
-FROM node:24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS builder
+# Only static assets reach nginx. Keep Node native to avoid QEMU crashes during npm ci.
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS builder
+ARG BUILDKIT_SBOM_SCAN_STAGE=true
 
 WORKDIR /app
+ENV npm_config_install_links=true
 
 # Copy source and build.
 COPY . .
@@ -25,15 +28,41 @@ ARG VITE_WS_API_URL=https://api.worldmonitor.app
 ENV VITE_VARIANT=${VITE_VARIANT}
 ENV VITE_WS_API_URL=${VITE_WS_API_URL}
 
-# Build the crawlable static corpus, then tsc + vite build directly like the
-# sidecar image's builder. `npm run build` would chain build:blog
-# (blog-site has its own lockfile, not installed here) and the prebuild
-# openapi/agent-skills generators.
-RUN npm run build:crawlable-corpus && npm run build:content-corpus && npx tsc && npx vite build
+# The crawlable-corpus step runs the source-attribution drift gate. Inventory
+# facts write untracked .js into api/, so the gate must see the pristine
+# checkout first (#7435). tsc + vite stay later so they copy the generated
+# assets into dist/.
+RUN npm run build:crawlable-corpus && npm run build:sitemap
+
+# Generated inventory assets are intentionally untracked. Recreate them in the
+# clean release image before Vite copies public/ into dist/.
+RUN node scripts/generate-inventory-facts.mjs
+
+# public/pro/ is a build product, not committed bytes (#6898), and
+# docker/nginx.conf.template routes `location ^~ /pro` + `/pro/assets/` — so
+# unlike /blog (deliberately skipped here) the image must build pro-test or it
+# serves a 404 behind a live route. build:pro installs pro-test's own lockfile.
+RUN npm run build:pro
+
+# tsc + vite build directly like the sidecar image's builder. `npm run build`
+# would chain build:blog (blog-site has its own lockfile, not installed here)
+# and the prebuild openapi/agent-skills generators.
+RUN npx tsc && npx vite build
+RUN test -s dist/product-facts.json
+# The SPA entry point. vite.config.ts's dashboardHtmlOutputPlugin renames
+# index.html -> dashboard.html, and docker/nginx.conf.template both indexes it
+# and falls back to it from `location /` — so if the rename ever changes, every
+# route in the image serves a 404 while every other assertion here still passes.
+RUN test -s dist/dashboard.html
+# Assert the /pro pages survived the public/ -> dist/ copy. build:pro succeeding
+# proves public/pro/ exists; it does NOT prove Vite copied it, and nginx routes
+# `location ^~ /pro` regardless (#6898). Without this an outDir/publicDir change
+# ships a green image that 404s behind a live route.
+RUN test -s dist/pro/index.html && test -s dist/pro/welcome.html
 
 
 # Stage 2: Serve the built assets from nginx.
-FROM nginx:alpine@sha256:54f2a904c251d5a34adf545a72d32515a15e08418dae0266e23be2e18c66fefa AS runtime
+FROM nginx:alpine@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3 AS runtime
 
 WORKDIR /usr/share/nginx/html
 
@@ -44,10 +73,11 @@ COPY --from=builder /app/dist/ ./
 COPY docker/nginx.conf.template /etc/nginx/nginx.conf.template
 COPY docker/nginx-security-headers.conf /etc/nginx/security_headers.conf
 COPY docker/nginx-embed-security-headers.conf /etc/nginx/embed_security_headers.conf
+COPY docker/nginx-oauth-authorize-security-headers.conf /etc/nginx/oauth_authorize_security_headers.conf
+COPY docker/nginx-youtube-embed-security-headers.conf /etc/nginx/youtube_embed_security_headers.conf
 COPY docker/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 EXPOSE 80
 
 CMD ["/docker-entrypoint.sh"]
-

@@ -11,7 +11,7 @@ import {
   type DependencyGraph,
 } from '@/services/infrastructure-cascade';
 import type { CascadeResult, CascadeImpactLevel, InfrastructureNode } from '@/types';
-import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+import { trustedHtml } from '@/utils/dom-utils';
 
 
 type NodeFilter = 'all' | 'cable' | 'pipeline' | 'port' | 'chokepoint';
@@ -45,7 +45,14 @@ export class CascadePanel extends Panel {
       this.render();
     } catch (error) {
       console.error('[CascadePanel] Init error:', error);
-      this.showError(t('common.failedDependencyGraph'));
+      // With no `onRetry`, `Panel.showError` leaves `retryCallback` null and so
+      // arms no countdown — and nothing else re-renders this panel: the error
+      // DOM carries none of the controls `setupDelegatedListeners` binds, and
+      // `refresh()` has no callers. The panel stayed dead for the session and
+      // the `setTrustedContent` clear below could never be reached.
+      // `preloadCables()` nulls its cached promise on failure, so a retry
+      // genuinely re-attempts the import.
+      this.showError(t('common.failedDependencyGraph'), () => void this.init());
     }
   }
 
@@ -133,7 +140,10 @@ export class CascadePanel extends Panel {
   private renderCascadeResult(): string {
     if (!this.cascadeResult) return '';
 
-    const { source, countriesAffected, redundancies } = this.cascadeResult;
+    const { source, countriesAffected, redundancies, dataQuality } = this.cascadeResult;
+    const estimateHtml = dataQuality?.estimated
+      ? `<div class="cascade-estimate-note" role="note">${t('components.cascade.estimateNote')}</div>`
+      : '';
 
     const countriesHtml = countriesAffected.length > 0
       ? countriesAffected.map(c => `
@@ -153,6 +163,7 @@ export class CascadePanel extends Panel {
           ${redundancies.map(r => `
             <div class="cascade-redundancy">
               <span class="cascade-redundancy-name">${escapeHtml(r.name)}</span>
+              ${r.avoidsCutZone === false ? `<span class="cascade-redundancy-zone">${t('components.cascade.sharesCutZone')}</span>` : ''}
               <span class="cascade-redundancy-capacity">${Math.round(r.capacityShare * 100)}%</span>
             </div>
           `).join('')}
@@ -172,6 +183,7 @@ export class CascadePanel extends Panel {
           <div class="cascade-countries">${countriesHtml}</div>
         </div>
         ${redundanciesHtml}
+        ${estimateHtml}
       </div>
     `;
   }
@@ -194,7 +206,7 @@ export class CascadePanel extends Panel {
       </div>
     `;
 
-    setTrustedHtml(this.content, trustedHtml(`
+    this.setTrustedContent(trustedHtml(`
       <div class="cascade-panel">
         ${statsHtml}
         ${this.renderSelector()}

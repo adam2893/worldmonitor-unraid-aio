@@ -1,6 +1,8 @@
+import { FoodPricesCard } from './FoodPricesCard';
+import { setTrustedHtml, trustedHtml, h } from '@/utils/dom-utils';
 import { Panel } from './Panel';
 import { t } from '@/services/i18n';
-import { escapeHtml, unsafeRawHtml } from '@/utils/sanitize';
+import { escapeHtml } from '@/utils/sanitize';
 import { getHydratedData } from '@/services/bootstrap';
 import { createLazyClient, getRpcBaseUrl, rpcFetch } from '@/services/rpc-client';
 
@@ -69,7 +71,7 @@ function buildChart(points: FaoFoodPricePoint[]): string {
     const y = yPos(v, yMin, yMax);
     return `
       <line x1="${ML}" y1="${y.toFixed(1)}" x2="${SVG_W - MR}" y2="${y.toFixed(1)}" stroke="rgba(255,255,255,0.06)" stroke-width="1"/>
-      <text x="${(ML - 3).toFixed(0)}" y="${y.toFixed(1)}" text-anchor="end" fill="rgba(255,255,255,0.35)" font-size="8" dominant-baseline="middle">${v.toFixed(0)}</text>`;
+      <text x="${(ML - 3).toFixed(0)}" y="${y.toFixed(1)}" text-anchor="end" fill="rgba(255,255,255,0.35)" style="font-size:calc(8px * var(--wm-panel-effective-scale, 1))" dominant-baseline="middle">${v.toFixed(0)}</text>`;
   }).join('');
 
   // X-axis labels (show every 3rd month to avoid crowding)
@@ -77,7 +79,7 @@ function buildChart(points: FaoFoodPricePoint[]): string {
     if (i % 3 !== 0 && i !== points.length - 1) return '';
     const x = xPos(i, points.length);
     const label = p.date;
-    return `<text x="${x.toFixed(1)}" y="${SVG_H - MB + 12}" text-anchor="middle" fill="rgba(255,255,255,0.4)" font-size="7">${escapeHtml(label)}</text>`;
+    return `<text x="${x.toFixed(1)}" y="${SVG_H - MB + 12}" text-anchor="middle" fill="rgba(255,255,255,0.4)" style="font-size:calc(7px * var(--wm-panel-effective-scale, 1))">${escapeHtml(label)}</text>`;
   }).join('');
 
   // Series lines
@@ -87,7 +89,7 @@ function buildChart(points: FaoFoodPricePoint[]): string {
     return `<polyline points="${coords}" fill="none" stroke="${s.color}" stroke-width="${s.key === 'ffpi' ? 2 : 1.2}" opacity="${s.key === 'ffpi' ? 1 : 0.7}"/>`;
   }).join('');
 
-  return `<svg viewBox="0 0 ${SVG_W} ${SVG_H}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;display:block">${yAxis}${xAxis}${lines}</svg>`;
+  return `<svg viewBox="0 0 ${SVG_W} ${SVG_H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="FAO food price index history by commodity group" style="width:100%;height:auto;display:block">${yAxis}${xAxis}${lines}</svg>`;
 }
 
 function buildLegend(): string {
@@ -97,11 +99,33 @@ function buildLegend(): string {
 }
 
 export class FaoFoodPriceIndexPanel extends Panel {
+  private readonly monthly = h('div', { className: 'fao-monthly-context' });
+  private readonly local = h('div');
+  private readonly foodPrices: FoodPricesCard;
   constructor() {
-    super({ id: 'fao-food-price-index', title: t('panels.faoFoodPriceIndex'), infoTooltip: t('components.faoFoodPriceIndex.infoTooltip') });
+    super({ id: 'fao-food-price-index', defaultRowSpan: 3, title: t('panels.faoFoodPriceIndex'), infoTooltip: t('components.faoFoodPriceIndex.infoTooltip') });
+    this.foodPrices = new FoodPricesCard(this.local);
+    this.setContentNodes(this.local, this.monthly);
   }
 
   public async fetchData(): Promise<void> {
+    await Promise.all([this.fetchMonthly(), this.fetchLocal()]);
+  }
+
+  private async fetchLocal(): Promise<void> {
+    try {
+      const data = await getEconomicClient().getFoodPrices({});
+      if (this.element.isConnected) {
+        const sources = data.sources ?? [];
+        if (data.unavailable || sources.length === 0) this.foodPrices.showError(() => void this.fetchLocal());
+        else this.foodPrices.update(sources);
+      }
+    } catch {
+      if (this.element.isConnected) this.foodPrices.showError(() => void this.fetchLocal());
+    }
+  }
+
+  private async fetchMonthly(): Promise<void> {
     try {
       const hydrated = getHydratedData('faoFoodPriceIndex') as GetFaoFoodPriceIndexResponse | undefined;
       if (hydrated?.points?.length) {
@@ -119,13 +143,18 @@ export class FaoFoodPriceIndexPanel extends Panel {
     } catch (err) {
       if (this.isAbortError(err)) return;
       if (!this.element?.isConnected) return;
-      this.showError(t('common.failedMarketData'), () => void this.fetchData());
+      this.showMonthlyError();
     }
+  }
+
+  private showMonthlyError(): void {
+    this.monthly.replaceChildren(h('p', {}, t('common.failedMarketData')),
+      h('button', { type: 'button', onclick: () => void this.fetchMonthly() }, t('common.retry')));
   }
 
   private renderChart(data: GetFaoFoodPriceIndexResponse): void {
     if (!data.points?.length) {
-      this.showError(t('common.failedMarketData'), () => void this.fetchData());
+      this.showMonthlyError();
       return;
     }
 
@@ -152,6 +181,6 @@ export class FaoFoodPriceIndexPanel extends Panel {
     const legend = `<div class="fao-legend">${buildLegend()}</div>`;
     const base = `<div class="fao-base-note">${escapeHtml(t('components.faoFoodPriceIndex.baseNote'))}</div>`;
 
-    this.setSafeContent(unsafeRawHtml(`<div class="fao-food-price-index-panel">${headline}${chart}${legend}${base}</div>`, 'legacy Panel.setContent() migration'));
+    setTrustedHtml(this.monthly, trustedHtml(`<h3>${escapeHtml(t('components.foodPrices.global'))}</h3><div class="fao-food-price-index-panel">${headline}${chart}${legend}${base}</div>`, 'Escaped FAO chart labels and numeric values'));
   }
 }

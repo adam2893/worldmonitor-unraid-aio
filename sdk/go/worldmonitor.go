@@ -6,10 +6,13 @@
 // Stdlib-only (zero dependencies), MCP-first — the same design as the
 // worldmonitor npm CLI this mirrors (cli/ in the main repository). The MCP
 // server (https://worldmonitor.app/mcp) is the live, documented agent
-// surface: tools/list is public, and tools/call (used by the curated
-// helpers) authenticates with a user API key. A small REST escape hatch
-// (Get/Health) rounds it out for host-relative and self-hosted use.
+// surface: tools/list is public. get_sources is the only data tool that can be
+// called without a key; the other tools/call operations authenticate with a
+// user API key. A small REST escape hatch (Get/Health) rounds it out for
+// host-relative and self-hosted use.
 //
+//	public := worldmonitor.New("")
+//	sources, err := public.CallTool(ctx, "get_sources", worldmonitor.Args{"view": "summary"})
 //	client := worldmonitor.New("wm_...") // or "" to read WORLDMONITOR_API_KEY
 //	risk, err := client.CountryRisk(ctx, "IR", nil)
 //	quotes, err := client.CallTool(ctx, "get_market_data", worldmonitor.Args{"asset_class": "crypto"})
@@ -35,7 +38,7 @@ import (
 
 // Version of this SDK. The release workflow checks it against the
 // sdk/go/vX.Y.Z tag before warming the module proxy.
-const Version = "0.1.1"
+const Version = "0.1.2"
 
 // UserAgent identifies the SDK on every request. Cloudflare's WAF challenges
 // generic library User-Agents (Go-http-client, curl, empty) on the API edge,
@@ -100,7 +103,8 @@ type Client struct {
 	BaseURL string
 	// MCPURL is the MCP endpoint (default https://worldmonitor.app/mcp).
 	MCPURL string
-	// HTTPClient performs requests; override its Transport in tests.
+	// HTTPClient performs requests; override its Transport in tests. Its
+	// CheckRedirect is ignored: redirects are never followed.
 	HTTPClient *http.Client
 }
 
@@ -320,7 +324,12 @@ func (c *Client) do(req *http.Request) (status int, contentType string, body []b
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultTimeout}
 	}
-	res, err := httpClient.Do(req)
+	// Never follow redirects: net/http forwards custom headers such as
+	// X-WorldMonitor-Key to the redirect target, even on another host. The
+	// 3xx surfaces as an APIError instead.
+	noRedirect := *httpClient
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	res, err := noRedirect.Do(req)
 	if err != nil {
 		return 0, "", nil, err
 	}

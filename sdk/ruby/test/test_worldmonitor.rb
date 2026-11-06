@@ -105,6 +105,16 @@ class TestMCPCalls < Minitest::Test
     refute rpc.key?("params")
   end
 
+  def test_get_sources_is_keyless
+    transport = FakeTransport.new([rpc_result({ "sources" => [] })])
+    result = WorldMonitor::Client.new(env: {}, transport: transport).call_tool("get_sources", view: "summary")
+    assert_equal({ "sources" => [] }, result)
+    request, = transport.requests.first
+    refute_includes request[:headers], WorldMonitor::API_KEY_HEADER
+    rpc = JSON.parse(request[:body])
+    assert_equal({ "name" => "get_sources", "arguments" => { "view" => "summary" } }, rpc["params"])
+  end
+
   def test_mcp_error_raises_with_auth_hint
     transport = FakeTransport.new([json_response(
       { "jsonrpc" => "2.0", "id" => 1,
@@ -156,5 +166,55 @@ class TestRest < Minitest::Test
     end
     assert_equal 401, err.status
     assert_includes err.message, "WORLDMONITOR_API_KEY"
+  end
+end
+
+class TestTrailingSlashes < Minitest::Test
+  def test_preserves_internal_slashes_and_unicode
+    ["https://example.com/é", "https://example.com/" + "/" * 20000 + "x"].each do |base|
+      client = WorldMonitor::Client.new(base_url: base + "///", env: {})
+      assert_equal base, client.base_url
+    end
+  end
+end
+
+class TestDefaultTransportRedirects < Minitest::Test
+  # Minimal one-request-per-connection HTTP server on 127.0.0.1.
+  def serve(&respond)
+    server = TCPServer.new("127.0.0.1", 0)
+    thread = Thread.new do
+      loop do
+        socket = server.accept
+        head = +""
+        head << socket.gets.to_s until head.end_with?("\r\n\r\n")
+        length = head[/^content-length:\s*(\d+)/i, 1].to_i
+        socket.read(length) if length.positive?
+        socket.write(respond.call(head))
+        socket.close
+      end
+    rescue IOError
+      nil
+    end
+    Minitest.after_run { server.close }
+    [thread, "http://127.0.0.1:#{server.addr[1]}"]
+  end
+
+  def test_redirects_are_not_followed
+    leaked = []
+    _, target = serve do |head|
+      leaked << head[/^x-worldmonitor-key:\s*(\S+)/i, 1]
+      "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}"
+    end
+    _, origin = serve do |head|
+      path = head[%r{\A\w+ (\S+)}, 1]
+      "HTTP/1.1 302 Found\r\nlocation: #{target}#{path}\r\ncontent-length: 0\r\n\r\n"
+    end
+    client = WorldMonitor::Client.new(api_key: "example-client-value", base_url: origin,
+                                      mcp_url: "#{origin}/mcp", env: {})
+    [-> { client.health }, -> { client.list_tools }].each do |call|
+      error = assert_raises(WorldMonitor::APIError) { call.call }
+      assert_equal 302, error.status
+    end
+    assert_empty leaked
   end
 end

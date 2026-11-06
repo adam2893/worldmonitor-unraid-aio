@@ -82,14 +82,22 @@ export REDIS_PASSWORD REDIS_TOKEN
 
 export LOCAL_API_PORT=46123
 export LOCAL_API_MODE=docker
+export WORLDMONITOR_SELF_HOST_PRO=1
 export LOCAL_API_CLOUD_FALLBACK=false
 export LOCAL_API_TOKEN="$(openssl rand -hex 32)"
+if [ -z "${WM_SESSION_SECRET:-}" ]; then
+  WM_SESSION_SECRET="$(printf '%s:wm-session' "$RELAY_SHARED_SECRET" | openssl dgst -sha256 | awk '{print $2}')"
+fi
+export WM_SESSION_SECRET
+node /app/validate-session-secret.mjs
 export UPSTASH_REDIS_REST_URL=http://127.0.0.1:8079
 export UPSTASH_REDIS_REST_TOKEN="$REDIS_TOKEN"
 export UPSTASH_ALLOW_INSECURE_HTTP=true
 export WS_RELAY_URL=http://127.0.0.1:3004
 export REDIS_REST_HOST=127.0.0.1
+export SRH_BIND_HOST=127.0.0.1
 export RELAY_HOST=127.0.0.1
+export RELAY_BIND_HOST=127.0.0.1
 export SRH_TOKEN="$REDIS_TOKEN"
 export SRH_CONNECTION_STRING="redis://:${REDIS_PASSWORD}@127.0.0.1:6379"
 export PORT=3004
@@ -122,6 +130,9 @@ esac
 chmod 0600 /tmp/valkey.conf
 chown appuser:appgroup /tmp/valkey.conf
 
+node /app/render-nginx-realip.mjs /tmp/nginx-realip.conf
+chmod 0600 /tmp/nginx-realip.conf
+chown appuser:appgroup /tmp/nginx-realip.conf
 envsubst '$LOCAL_API_PORT $LOCAL_API_TOKEN' < /etc/nginx/nginx.conf.template > /tmp/nginx.conf
 node -e "const fs=require('fs');const p='/tmp/nginx.conf';let s=fs.readFileSync(p,'utf8');s=s.replace('error_log /dev/stderr warn;','error_log stderr warn;').replace('access_log /dev/stdout main;','access_log off;').replace('http {','http {\\n  server_tokens off;\\n  client_max_body_size 2m;\\n  client_header_timeout 10s;\\n  client_body_timeout 10s;\\n  send_timeout 30s;');fs.writeFileSync(p,s);"
 chmod 0600 /tmp/nginx.conf

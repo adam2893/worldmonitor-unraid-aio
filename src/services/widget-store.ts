@@ -1,12 +1,16 @@
 import { loadFromStorage, saveToStorage } from '@/utils';
+import { safeStorageGet } from '@/utils/safe-storage';
 import { clearPanelColSpanEntry, clearPanelSpanEntry } from '@/utils/panel-storage';
 import { getAuthState } from '@/services/auth-state';
-import { isEntitled } from '@/services/entitlements';
+import { isEntitled, getEntitlementState } from '@/services/entitlements';
 import {
-  clearLegacyKeyStorage,
+  clearBrowserKeySession,
   migrateLegacyKeysToHttpOnlySession,
+  readBrowserKeySessionStatus,
   readLegacySessionKey,
 } from '@/services/browser-key-session';
+import { isSelfHostKeyUnlocked, subscribeSelfHostKey } from '@/services/self-host-key';
+import { isSelfHostedRuntime } from '@/config/self-host-runtime';
 
 const STORAGE_KEY = 'wm-custom-widgets';
 const MAX_WIDGETS = 10;
@@ -42,16 +46,34 @@ export interface CustomWidgetSpec {
   updatedAt: number;
 }
 
-export function loadWidgets(): CustomWidgetSpec[] {
-  const raw = loadFromStorage<CustomWidgetSpec[]>(STORAGE_KEY, []);
+function materializeWidgets(raw: unknown, strict: boolean): CustomWidgetSpec[] {
+  if (!Array.isArray(raw)) {
+    if (strict) throw new Error('Stored custom widgets must be an array');
+    return [];
+  }
+
   const result: CustomWidgetSpec[] = [];
-  for (const w of raw) {
+  for (const candidate of raw) {
+    if (
+      typeof candidate !== 'object' ||
+      candidate === null ||
+      typeof (candidate as Partial<CustomWidgetSpec>).id !== 'string'
+    ) {
+      if (strict) throw new Error('Stored custom widget is malformed');
+      continue;
+    }
+    const w = candidate as CustomWidgetSpec;
+    // Legacy widgets predate the `tier` field (added after custom widgets
+    // shipped) and have no `tier` key at all. Both loaders normalize a
+    // missing/invalid tier to 'basic' rather than dropping the widget from
+    // the dashboard.
     const tier = w.tier === 'pro' ? 'pro' : 'basic';
     if (tier === 'pro') {
-      const sideKeyHtml = localStorage.getItem(proHtmlKey(w.id));
+      const sideKeyHtml = safeStorageGet(proHtmlKey(w.id));
       const storedHtml = typeof w.html === 'string' ? w.html : '';
       const proHtml = storedHtml || sideKeyHtml;
       if (!proHtml) {
+        if (strict) throw new Error('Stored Pro widget is missing HTML');
         // HTML missing — drop widget and clean up spans
         clearPanelSpanEntry(w.id);
         clearPanelColSpanEntry(w.id);
@@ -59,10 +81,29 @@ export function loadWidgets(): CustomWidgetSpec[] {
       }
       result.push({ ...w, tier, html: proHtml });
     } else {
+      if (strict && typeof w.html !== 'string') {
+        throw new Error('Stored basic widget is missing HTML');
+      }
       result.push({ ...w, tier: 'basic' });
     }
   }
   return result;
+}
+
+export function loadWidgets(): CustomWidgetSpec[] {
+  return materializeWidgets(loadFromStorage<unknown>(STORAGE_KEY, []), false);
+}
+
+/**
+ * Activation-cohort reads must distinguish a genuinely empty widget list from
+ * unavailable or malformed storage. The regular loader intentionally degrades
+ * those failures to `[]` for dashboard resilience.
+ */
+export function loadWidgetsStrict(): CustomWidgetSpec[] {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (raw === null) return [];
+  const parsed: unknown = JSON.parse(raw);
+  return materializeWidgets(parsed, true);
 }
 
 export async function saveWidget(spec: CustomWidgetSpec): Promise<void> {
@@ -112,43 +153,101 @@ export function getWidget(id: string): CustomWidgetSpec | null {
 // JS-readable cookies. New writes go to /api/wm-session, which sets short-lived
 // HttpOnly cookies. We keep only a tab-local hint so current-page flows can
 // update immediately without re-exposing the raw key after reload.
+//
+// A hint turns on only when the server has said the key is valid: an accepted
+// exchange, or the boot status read (GET /api/wm-session) that restores an
+// accepted key after a reload. A key that is merely present proves nothing.
 
 let widgetSessionHint = false;
 let proSessionHint = false;
 let migrationStarted = false;
+// Bumped by every explicit key change, so a status answer requested before the
+// change cannot overwrite it.
+let hintGeneration = 0;
+const accessListeners = new Set<() => void>();
+
+function notifyAccessChanged(): void {
+  for (const listener of accessListeners) listener();
+}
+
+// A self-hosted install's desktop-key verdict is a Pro signal too (KTD9), so
+// its unlock changes reach the same listeners. Other verdict changes (a status
+// message, a failed check) do not change access and are not forwarded.
+let selfHostUnlocked = false;
+subscribeSelfHostKey(() => {
+  const unlocked = isSelfHostKeyUnlocked();
+  if (unlocked === selfHostUnlocked) return;
+  selfHostUnlocked = unlocked;
+  notifyAccessChanged();
+});
+
+/** Observe tab-local tester-key and self-host key access changes without exposing credential values. */
+export function subscribeWidgetAccess(listener: () => void): () => void {
+  accessListeners.add(listener);
+  return () => accessListeners.delete(listener);
+}
+
+function applyHints(next: { widget?: boolean; pro?: boolean }): void {
+  const widget = next.widget ?? widgetSessionHint;
+  const pro = next.pro ?? proSessionHint;
+  if (widget === widgetSessionHint && pro === proSessionHint) return;
+  widgetSessionHint = widget;
+  proSessionHint = pro;
+  notifyAccessChanged();
+}
+
+async function restoreKeySessionHints(widgetKey: string, proKey: string): Promise<void> {
+  if (widgetKey || proKey) {
+    const generation = hintGeneration;
+    // A rejected key is removed from storage; a transport failure keeps it for
+    // the next boot. Neither turns a hint on.
+    const result = await migrateLegacyKeysToHttpOnlySession({ widgetKey, proKey });
+    if (generation === hintGeneration) {
+      applyHints({
+        widget: result.widget === 'accepted' ? true : undefined,
+        pro: result.pro === 'accepted' ? true : undefined,
+      });
+    }
+  }
+  const generation = hintGeneration;
+  const status = await readBrowserKeySessionStatus();
+  if (status && generation === hintGeneration) applyHints(status);
+}
 
 function migrateLegacyKeyStorage(): void {
   if (migrationStarted || typeof window === 'undefined') return;
   migrationStarted = true;
   const widgetKey = readLegacySessionKey('wm-widget-key');
   const proKey = readLegacySessionKey('wm-pro-key');
-  if (!widgetKey && !proKey) return;
-  widgetSessionHint = !!widgetKey;
-  proSessionHint = !!proKey;
-  void migrateLegacyKeysToHttpOnlySession({ widgetKey, proKey })
-    .catch(() => { /* retry on next boot; keep legacy storage until success */ });
+  // Never awaited: auth and bootstrap init must not wait on this.
+  void restoreKeySessionHints(widgetKey, proKey)
+    .catch(() => { /* retry on next boot; a transport failure keeps legacy storage */ });
 }
 
-export function setWidgetKey(key: string): void {
+async function setKeySession(name: 'wm-widget-key' | 'wm-pro-key', key: string): Promise<boolean> {
   const trimmed = key.trim();
-  widgetSessionHint = !!trimmed;
-  if (!trimmed) {
-    clearLegacyKeyStorage('wm-widget-key');
-    return;
+  const field = name === 'wm-widget-key' ? 'widget' : 'pro';
+  // Any explicit change outranks a status answer still in flight.
+  hintGeneration += 1;
+  const ok = trimmed
+    ? (await migrateLegacyKeysToHttpOnlySession(field === 'widget' ? { widgetKey: trimmed } : { proKey: trimmed })).ok
+    : await clearBrowserKeySession(name);
+  // A rejected key leaves the server's previous cookie in place, so the hint
+  // keeps describing that cookie.
+  if (ok) {
+    if (field === 'widget') widgetSessionHint = !!trimmed;
+    else proSessionHint = !!trimmed;
+    notifyAccessChanged();
   }
-  void migrateLegacyKeysToHttpOnlySession({ widgetKey: trimmed })
-    .catch(() => { /* caller can retry; no new JS-readable write */ });
+  return ok;
 }
 
-export function setProKey(key: string): void {
-  const trimmed = key.trim();
-  proSessionHint = !!trimmed;
-  if (!trimmed) {
-    clearLegacyKeyStorage('wm-pro-key');
-    return;
-  }
-  void migrateLegacyKeysToHttpOnlySession({ proKey: trimmed })
-    .catch(() => { /* caller can retry; no new JS-readable write */ });
+export function setWidgetKey(key: string): Promise<boolean> {
+  return setKeySession('wm-widget-key', key);
+}
+
+export function setProKey(key: string): Promise<boolean> {
+  return setKeySession('wm-pro-key', key);
 }
 
 export function isWidgetFeatureEnabled(): boolean {
@@ -185,11 +284,40 @@ export function isProWidgetEnabled(): boolean {
 
 export function isProUser(): boolean {
   return (
+    isSelfHostedRuntime() ||
     isWidgetFeatureEnabled() ||
     isProWidgetEnabled() ||
     getAuthState().user?.role === 'pro' ||
-    isEntitled()
+    isEntitled() ||
+    isSelfHostKeyUnlocked()
   );
+}
+
+/**
+ * Whether `isProUser()` is answering from settled signals rather than from
+ * "nothing has loaded yet".
+ *
+ * A false from isProUser() is ambiguous on a normal page load: Clerk is not
+ * awaited, and for a signed-in user the Convex entitlement snapshot lands later
+ * still, so a paying subscriber reads as free for the first seconds. Callers
+ * that PERSIST a free-tier decision (the boot clamp, the dashboard-tab
+ * snapshot heal) must wait for this before writing, or they overwrite a Pro
+ * user's layout on every load.
+ *
+ * A true from isProUser() is always definitive — no signal that says "Pro"
+ * needs confirmation.
+ *
+ * Mirrors `shouldDeferFreeTierEnforcement` in config/panels.ts, which App uses
+ * for the same decision plus its grace-timer backstop. The rule is stated twice
+ * rather than shared because importing config from services would close a
+ * config <-> services import cycle; keep the two in sync.
+ */
+export function isProTierResolved(): boolean {
+  if (isProUser()) return true;
+  const session = getAuthState();
+  if (session.isPending) return false;
+  // Anonymous is a settled answer; a signed-in user still needs the snapshot.
+  return session.user === null || getEntitlementState() !== null;
 }
 
 export function getProWidgetKey(): string {

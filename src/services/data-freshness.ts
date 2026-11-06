@@ -20,6 +20,7 @@ export interface DataSourceState {
   lastError: string | null;
   itemCount: number;
   enabled: boolean;
+  mapLayerEnabled: boolean;
   status: FreshnessStatus;
   // Drives the StrategicRiskPanel hard insufficient-data gate; not the full list of CII score inputs.
   requiredForRisk: boolean;
@@ -94,7 +95,17 @@ const SOURCE_METADATA: Record<DataSourceId, { name: string; requiredForRisk: boo
   pizzint: { name: 'PizzINT Monitoring', requiredForRisk: false, panelId: 'intel' },
   outages: { name: 'Internet Outages', requiredForRisk: false, panelId: 'outages' },
   cyber_threats: { name: 'Cyber Threat IOCs', requiredForRisk: false, panelId: 'map' },
+  // This branch widened the weather source to cover ECCC as well as NWS; main's
+  // road entries below are untouched by that.
   weather: { name: 'Weather Alerts', requiredForRisk: false, panelId: 'weather' },
+  // One entry per CANADA_ROAD_SOURCES descriptor. Five sources union onto the
+  // canadaRoads layer, and recording them all as ontario_511 made an Alberta,
+  // Toronto or BC outage read as an Ontario one — or vanish entirely.
+  ontario_511: { name: 'Ontario Roads (511)', requiredForRisk: false, panelId: 'map' },
+  alberta_511: { name: 'Alberta Roads (511)', requiredForRisk: false, panelId: 'map' },
+  manitoba_511: { name: 'Manitoba Roads (511)', requiredForRisk: false, panelId: 'map' },
+  toronto_roads: { name: 'Toronto Road Restrictions', requiredForRisk: false, panelId: 'map' },
+  bc_open511: { name: 'BC Roads (Open511)', requiredForRisk: false, panelId: 'map' },
   economic: { name: 'Economic Data (FRED)', requiredForRisk: false, panelId: 'economic' },
   oil: { name: 'Oil Analytics (EIA)', requiredForRisk: false, panelId: 'economic' },
   spending: { name: 'Gov Spending', requiredForRisk: false, panelId: 'economic' },
@@ -167,6 +178,7 @@ class DataFreshnessTracker {
         lastError: null,
         itemCount: 0,
         enabled: true, // Assume enabled by default
+        mapLayerEnabled: true,
         status: 'no_data',
         requiredForRisk: meta.requiredForRisk,
         freshnessEvidence: null,
@@ -182,7 +194,7 @@ class DataFreshnessTracker {
     if (source) {
       if (isHealthMappedSource(sourceId) && source.freshnessEvidence === 'seed-health') {
         source.itemCount += itemCount;
-        source.status = source.enabled ? this.calculateStatus(source) : 'disabled';
+        source.status = this.monitoringStatus(source);
         this.notifyListeners();
         return;
       }
@@ -202,7 +214,7 @@ class DataFreshnessTracker {
     const source = this.sources.get(sourceId);
     if (source) {
       if (isHealthMappedSource(sourceId) && source.freshnessEvidence === 'seed-health') {
-        source.status = source.enabled ? this.calculateStatus(source) : 'disabled';
+        source.status = this.monitoringStatus(source);
         this.notifyListeners();
         return;
       }
@@ -255,20 +267,33 @@ class DataFreshnessTracker {
         : ageMin !== null
         ? new Date(checkedAtMs - ageMin * 60_000)
         : source.lastUpdate;
-      source.status = source.enabled ? this.calculateStatus(source) : 'disabled';
+      source.status = this.monitoringStatus(source);
       changed = true;
     }
     if (changed) this.notifyListeners();
   }
 
   /**
-   * Set whether a source is enabled/disabled
+   * Set whether this client can collect the source at all (configured, feature available).
    */
   setEnabled(sourceId: DataSourceId, enabled: boolean): void {
     const source = this.sources.get(sourceId);
     if (source) {
       source.enabled = enabled;
-      source.status = enabled ? this.calculateStatus(source) : 'disabled';
+      source.status = this.monitoringStatus(source);
+      this.notifyListeners();
+    }
+  }
+
+  /**
+   * Record whether the map layer that draws this source is on. Panels load their
+   * data regardless of the layer, so this only affects the monitoring summary.
+   */
+  setMapLayerEnabled(sourceId: DataSourceId, enabled: boolean): void {
+    const source = this.sources.get(sourceId);
+    if (source) {
+      source.mapLayerEnabled = enabled;
+      source.status = this.monitoringStatus(source);
       this.notifyListeners();
     }
   }
@@ -280,7 +305,7 @@ class DataFreshnessTracker {
     const source = this.sources.get(sourceId);
     if (source) {
       // Recalculate status in case time has passed
-      source.status = source.enabled ? this.calculateStatus(source) : 'disabled';
+      source.status = this.monitoringStatus(source);
     }
     return source;
   }
@@ -291,7 +316,7 @@ class DataFreshnessTracker {
   getAllSources(): DataSourceState[] {
     return Array.from(this.sources.values()).map(source => ({
       ...source,
-      status: source.enabled ? this.calculateStatus(source) : 'disabled',
+      status: this.monitoringStatus(source),
     }));
   }
 
@@ -369,15 +394,21 @@ class DataFreshnessTracker {
   }
 
   /**
+   * Whether every source behind a panel is covered by /api/health, so the panel
+   * can carry a header badge once seed-health evidence arrives.
+   */
+  hasPanelFreshnessSources(panelId: string): boolean {
+    const sourceIds = this.getSourceIdsForPanel(panelId);
+    return sourceIds.length > 0 && sourceIds.every(isHealthMappedSource);
+  }
+
+  /**
    * Get freshness sources that contribute to a panel header badge.
    */
   getSourcesForPanel(panelId: string): PanelFreshnessSource[] {
-    const sourceIds = this.getSourceIdsForPanel(panelId);
-    if (sourceIds.length === 0 || sourceIds.some(sourceId => !isHealthMappedSource(sourceId))) {
-      return [];
-    }
+    if (!this.hasPanelFreshnessSources(panelId)) return [];
 
-    const sources = sourceIds.map(sourceId => this.getSource(sourceId));
+    const sources = this.getSourceIdsForPanel(panelId).map(sourceId => this.sources.get(sourceId));
     if (sources.some(source => !source || source.freshnessEvidence !== 'seed-health')) {
       return [];
     }
@@ -387,7 +418,7 @@ class DataFreshnessTracker {
       .map(source => ({
         id: source.id,
         name: source.name,
-        status: source.status,
+        status: this.calculateStatus(source),
         lastUpdate: source.lastUpdate,
         itemCount: source.itemCount,
         healthStatus: source.healthStatus,
@@ -450,6 +481,10 @@ class DataFreshnessTracker {
     return () => this.listeners.delete(listener);
   }
 
+  private monitoringStatus(source: DataSourceState): FreshnessStatus {
+    return source.mapLayerEnabled ? this.calculateStatus(source) : 'disabled';
+  }
+
   private calculateStatus(source: DataSourceState): FreshnessStatus {
     if (!source.enabled) return 'disabled';
     if (source.lastError) return 'error';
@@ -462,6 +497,9 @@ class DataFreshnessTracker {
     if (age <= freshThreshold) return source.healthStatus === 'COVERAGE_PARTIAL'
       || source.healthStatus === 'STALE_CONTENT'
       || source.healthStatus === 'STALE_SEED'
+      || source.healthStatus === 'COVERAGE_DEGRADED'
+      || source.healthStatus === 'CHINA_DEGRADED'
+      || source.healthStatus === 'ROLLOUT_PENDING'
       ? 'stale'
       : 'fresh';
     if (age <= staleThreshold) return 'stale';
@@ -470,7 +508,10 @@ class DataFreshnessTracker {
   }
 
   private healthStatusIsError(status: string): boolean {
-    return status === 'SEED_ERROR' || status === 'REDIS_DOWN' || status === 'REDIS_PARTIAL';
+    return status === 'SEED_ERROR' || status === 'REDIS_DOWN' || status === 'REDIS_PARTIAL'
+      // Server-crit: a fresh-aged CHINA_UNAVAILABLE must render as an error, not
+      // pass through calculateStatus's age check as 'fresh' (api/health.js crit).
+      || status === 'CHINA_UNAVAILABLE';
   }
 
   private healthStatusHasNoData(status: string): boolean {
@@ -549,7 +590,12 @@ const INTELLIGENCE_GAP_MESSAGES: Record<DataSourceId, string> = {
   pizzint: 'PizzINT monitor unavailable—location/tension tracking degraded',
   outages: 'Internet disruptions may be unreported—outage monitoring offline',
   cyber_threats: 'Cyber IOC map points unavailable—malicious infrastructure visibility reduced',
-  weather: 'Severe weather warnings may be missed—weather alerts unavailable',
+  weather: 'Official weather warnings may be missed—NWS, ECCC, or WMO SWIC alerts unavailable',
+  ontario_511: 'Ontario highway incidents may be missed—511 feed unavailable',
+  alberta_511: 'Alberta highway incidents may be missed—511 feed unavailable',
+  manitoba_511: 'Manitoba highway incidents may be missed—511 feed unavailable',
+  toronto_roads: 'Toronto road restrictions may be missed—City of Toronto feed unavailable',
+  bc_open511: 'BC highway incidents may be missed—Open511 feed unavailable',
   economic: 'Economic indicators stale—Fed/Treasury data not updating',
   oil: 'Oil market analytics unavailable—EIA data not updating',
   spending: 'Government spending data unavailable',

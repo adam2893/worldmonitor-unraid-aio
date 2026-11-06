@@ -2,12 +2,14 @@
 ARG BASE_IMAGE=worldmonitor-upstream:local
 
 # Pinned node:24-alpine (linux/amd64 and linux/arm64 manifest list).
-FROM node:24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS relay-deps
+FROM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS relay-deps
 WORKDIR /relay
+ENV npm_config_install_links=true
 COPY scripts/package.json scripts/package-lock.json ./
+COPY scripts/vendor/deepmerge/ ./vendor/deepmerge/
 RUN npm ci --omit=dev --omit=optional --ignore-scripts
 
-FROM node:24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS redis-rest-deps
+FROM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS redis-rest-deps
 WORKDIR /rest
 COPY docker/unraid/redis-rest-package.json ./package.json
 COPY docker/unraid/redis-rest-package-lock.json ./package-lock.json
@@ -29,7 +31,7 @@ LABEL org.opencontainers.image.title="World Monitor AIO for Unraid" \
 RUN apk add --no-cache \
       valkey=9.0.4-r0 \
       valkey-cli=9.0.4-r0 \
-      curl=8.22.0-r0 \
+      curl=8.23.0-r0 \
       coreutils=9.11-r0 \
       openssl=3.5.9-r0 \
       su-exec=0.3-r0 && \

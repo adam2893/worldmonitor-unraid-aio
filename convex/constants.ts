@@ -5,6 +5,7 @@ export const channelTypeValidator = v.union(
   v.literal("slack"),
   v.literal("email"),
   v.literal("discord"),
+  v.literal("teams"),
   v.literal("webhook"),
   v.literal("web_push"),
 );
@@ -26,6 +27,12 @@ export const digestModeValidator = v.union(
   v.literal("daily"),
   v.literal("twice_daily"),
   v.literal("weekly"),
+);
+
+export const proActivationStepIdValidator = v.union(
+  v.literal("brief"),
+  v.literal("alerts"),
+  v.literal("power"),
 );
 
 export const CURRENT_PREFS_SCHEMA_VERSION = 1;

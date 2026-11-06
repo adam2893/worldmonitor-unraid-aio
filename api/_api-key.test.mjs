@@ -76,26 +76,91 @@ test('valid HttpOnly wm-session cookie is accepted without JS-readable auth head
 });
 
 test('HttpOnly wm-pro-key cookie is accepted as enterprise key without a JS-readable header', async () => {
-  const r = await validateApiKey(makeReq({ cookie: `wm-pro-key=${encodeURIComponent(ENTERPRISE_KEY)}` }));
+  const r = await validateApiKey(makeReq({ cookie: `__Host-wm-pro-key=${encodeURIComponent(ENTERPRISE_KEY)}` }));
   assert.equal(r.valid, true);
   assert.equal(r.required, true);
   assert.equal(r.kind, 'enterprise');
+  assert.equal(r.credential, ENTERPRISE_KEY, 'result must expose the credential that actually authenticated');
 });
 
 test('HttpOnly wm-widget-key cookie is accepted as enterprise key without a JS-readable header', async () => {
-  const r = await validateApiKey(makeReq({ cookie: `wm-widget-key=${encodeURIComponent(ENTERPRISE_KEY)}` }));
+  const r = await validateApiKey(makeReq({ cookie: `__Host-wm-widget-key=${encodeURIComponent(ENTERPRISE_KEY)}` }));
   assert.equal(r.valid, true);
   assert.equal(r.required, true);
   assert.equal(r.kind, 'enterprise');
+  assert.equal(r.credential, ENTERPRISE_KEY, 'result must expose the credential that actually authenticated');
+});
+
+test('a stale protected cookie does not mask the other valid enterprise cookie', async () => {
+  for (const cookie of [
+    `__Host-wm-pro-key=stale; __Host-wm-widget-key=${encodeURIComponent(ENTERPRISE_KEY)}`,
+    `__Host-wm-pro-key=${encodeURIComponent(ENTERPRISE_KEY)}; __Host-wm-widget-key=stale`,
+  ]) {
+    const accepted = await validateApiKey(makeReq({ cookie, key: 'wms_automatic' }), { forceKey: true });
+    assert.equal(accepted.valid, true);
+    assert.equal(accepted.credential, ENTERPRISE_KEY);
+    const rejected = await validateApiKey(makeReq({ cookie, key: 'explicit-invalid' }), { forceKey: true });
+    assert.equal(rejected.valid, false);
+    assert.equal(rejected.error, 'Invalid API key');
+  }
 });
 
 test('dual wm-pro-key cookies use the first value sent by the browser', async () => {
   const r = await validateApiKey(makeReq({
-    cookie: `wm-pro-key=${encodeURIComponent(ENTERPRISE_KEY)}; wm-pro-key=old-js-readable-key`,
+    cookie: `__Host-wm-pro-key=${encodeURIComponent(ENTERPRISE_KEY)}; __Host-wm-pro-key=old-js-readable-key`,
   }));
   assert.equal(r.valid, true);
   assert.equal(r.required, true);
   assert.equal(r.kind, 'enterprise');
+});
+
+test('a stale wm-session cookie does not shadow a later valid one', async () => {
+  // Browsers send an older host-only wm-session before a newer
+  // Domain=.worldmonitor.app one. The tombstone in api/wm-session.js only
+  // clears it once the browser re-mints on the api host, so the reader must
+  // not stop at the first stale value.
+  const { token } = await issueSessionToken();
+  for (const cookie of [
+    `wm-session=wms_invalid; wm-session=${encodeURIComponent(token)}`,
+    `wm-session=${encodeURIComponent(token)}; wm-session=wms_invalid`,
+  ]) {
+    const r = await validateApiKey(makeReq({ cookie }));
+    assert.equal(r.valid, true, cookie);
+    assert.equal(r.kind, 'session');
+  }
+});
+
+test('wm-session candidates are capped so one request cannot buy unbounded validation work', async () => {
+  // A host-only plus a Domain cookie is the real duplicate case; a caller
+  // packing hundreds of values must not get each one HMAC-validated.
+  const { token } = await issueSessionToken();
+  const padding = Array.from({ length: 4 }, (_, i) => `wm-session=wms_invalid_${i}`).join('; ');
+  const r = await validateApiKey(makeReq({ cookie: `${padding}; wm-session=${encodeURIComponent(token)}` }));
+  assert.equal(r.valid, false, 'a value past the candidate cap is never validated');
+  assert.equal(r.error, 'Invalid session token');
+});
+
+test('empty wm-session values do not use up the candidate cap', async () => {
+  const { token } = await issueSessionToken();
+  const empties = Array.from({ length: 4 }, () => 'wm-session=').join('; ');
+  const r = await validateApiKey(makeReq({ cookie: `${empties}; wm-session=${encodeURIComponent(token)}` }));
+  assert.equal(r.valid, true);
+  assert.equal(r.kind, 'session');
+});
+
+test('duplicate wm-session cookies that are all invalid stay rejected', async () => {
+  const r = await validateApiKey(makeReq({ cookie: 'wm-session=wms_invalid; wm-session=wms_also_invalid' }));
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'Invalid session token');
+});
+
+test('a valid duplicate wm-session cookie still cannot satisfy forceKey', async () => {
+  const { token } = await issueSessionToken();
+  const r = await validateApiKey(makeReq({
+    cookie: `wm-session=wms_invalid; wm-session=${encodeURIComponent(token)}`,
+  }), { forceKey: true });
+  assert.equal(r.valid, false);
+  assert.equal(r.error, 'Pro authentication required');
 });
 
 test('PR #3557 review: wms_ session token is REJECTED when forceKey=true (premium endpoints)', async () => {
@@ -106,6 +171,104 @@ test('PR #3557 review: wms_ session token is REJECTED when forceKey=true (premiu
   const r = await validateApiKey(makeReq({ key: token }), { forceKey: true });
   assert.equal(r.valid, false);
   assert.equal(r.required, true);
+  assert.match(r.error, /Pro authentication/);
+});
+
+// Returning tester/widget users mint a wms_ token in a new tab. JS cannot see
+// HttpOnly wm-pro-key / wm-widget-key, so sendWith still attaches wms_. A
+// session-shaped header must not beat the tester cookie (kind:'session' would
+// 401 forceKey paths even though a valid pro cookie is on the wire).
+
+test('wms_ header + wm-pro-key cookie authenticates as enterprise (header + shadowed cookie → valid)', async () => {
+  const { token } = await issueSessionToken();
+  const r = await validateApiKey(makeReq({
+    key: token,
+    cookie: `__Host-wm-pro-key=${encodeURIComponent(ENTERPRISE_KEY)}`,
+  }));
+  assert.equal(r.valid, true);
+  assert.equal(r.kind, 'enterprise');
+  assert.equal(r.credential, ENTERPRISE_KEY, 'automatic wms_ must not become the enterprise principal');
+});
+
+test('wms_ header + wm-pro-key cookie + forceKey still authenticates as enterprise', async () => {
+  const { token } = await issueSessionToken();
+  const r = await validateApiKey(makeReq({
+    key: token,
+    cookie: `__Host-wm-pro-key=${encodeURIComponent(ENTERPRISE_KEY)}`,
+  }), { forceKey: true });
+  assert.equal(r.valid, true, 'wms_ must not 401 a forceKey request that also carries wm-pro-key');
+  assert.equal(r.kind, 'enterprise');
+  assert.equal(r.credential, ENTERPRISE_KEY);
+});
+
+test('wms_ header + wm-widget-key cookie authenticates as enterprise (header + shadowed cookie → valid)', async () => {
+  const { token } = await issueSessionToken();
+  const r = await validateApiKey(makeReq({
+    key: token,
+    cookie: `__Host-wm-widget-key=${encodeURIComponent(ENTERPRISE_KEY)}`,
+  }));
+  assert.equal(r.valid, true);
+  assert.equal(r.kind, 'enterprise');
+  assert.equal(r.credential, ENTERPRISE_KEY, 'automatic wms_ must not become the enterprise principal');
+});
+
+test('wms_ header + wm-widget-key cookie + forceKey still authenticates as enterprise', async () => {
+  const { token } = await issueSessionToken();
+  const r = await validateApiKey(makeReq({
+    key: token,
+    cookie: `__Host-wm-widget-key=${encodeURIComponent(ENTERPRISE_KEY)}`,
+  }), { forceKey: true });
+  assert.equal(r.valid, true, 'wms_ must not 401 a forceKey request that also carries wm-widget-key');
+  assert.equal(r.kind, 'enterprise');
+  assert.equal(r.credential, ENTERPRISE_KEY);
+});
+
+for (const cookieName of ['wm-pro-key', 'wm-widget-key']) {
+  test(`stale ${cookieName} does not shadow a valid wms_ header on anonymous routes`, async () => {
+    const { token } = await issueSessionToken();
+    const r = await validateApiKey(makeReq({
+      key: token,
+      cookie: `${cookieName}=${encodeURIComponent('rotated-old-key')}`,
+    }));
+    assert.equal(r.valid, true);
+    assert.equal(r.required, false);
+    assert.equal(r.kind, 'session');
+    assert.equal(r.credential, undefined);
+  });
+}
+
+test('stale tester cookie does not shadow a valid HttpOnly wm-session cookie', async () => {
+  const { token } = await issueSessionToken();
+  const r = await validateApiKey(makeReq({
+    cookie: `__Host-wm-pro-key=${encodeURIComponent('rotated-old-key')}; wm-session=${encodeURIComponent(token)}`,
+  }));
+  assert.equal(r.valid, true);
+  assert.equal(r.required, false);
+  assert.equal(r.kind, 'session');
+});
+
+test('stale tester cookie cannot turn anonymous authority into forceKey access', async () => {
+  const { token } = await issueSessionToken();
+  const r = await validateApiKey(makeReq({
+    key: token,
+    cookie: `__Host-wm-pro-key=${encodeURIComponent('rotated-old-key')}`,
+  }), { forceKey: true });
+  assert.equal(r.valid, false);
+  assert.equal(r.required, true);
+  assert.match(r.error, /Pro authentication/);
+});
+
+test('wms_ header ALONE is still kind session (XP preserved)', async () => {
+  const { token } = await issueSessionToken();
+  const r = await validateApiKey(makeReq({ key: token }));
+  assert.equal(r.valid, true);
+  assert.equal(r.kind, 'session');
+});
+
+test('wms_ header ALONE + forceKey is still rejected with Pro authentication', async () => {
+  const { token } = await issueSessionToken();
+  const r = await validateApiKey(makeReq({ key: token }), { forceKey: true });
+  assert.equal(r.valid, false);
   assert.match(r.error, /Pro authentication/);
 });
 
@@ -122,6 +285,7 @@ test('enterprise key carries kind=enterprise (the only key kind that bypasses en
   const r = await validateApiKey(makeReq({ key: ENTERPRISE_KEY }));
   assert.equal(r.valid, true);
   assert.equal(r.kind, 'enterprise');
+  assert.equal(r.credential, ENTERPRISE_KEY);
 });
 
 test('enterprise key allowlist uses timingSafeIncludes, not Array.includes', async () => {
@@ -209,6 +373,30 @@ test('REGRESSION: wm_-prefixed key in WORLDMONITOR_VALID_KEYS is honored as ente
     assert.equal(r.kind, 'enterprise', 'must be kind=enterprise so gateway skips entitlement check');
   } finally {
     process.env.WORLDMONITOR_VALID_KEYS = previous;
+  }
+});
+
+test('WORLDMONITOR_VALID_KEYS entries are trimmed like server/_shared/premium-check.ts', async () => {
+  // "k1, k2" authenticated k2 at the gateway's premium check but not here.
+  const previous = process.env.WORLDMONITOR_VALID_KEYS;
+  process.env.WORLDMONITOR_VALID_KEYS = ` ${ENTERPRISE_KEY} , spaced-operator-key ,`;
+  try {
+    for (const key of [ENTERPRISE_KEY, 'spaced-operator-key']) {
+      const r = await validateApiKey(makeReq({ key }));
+      assert.equal(r.valid, true, key);
+      assert.equal(r.kind, 'enterprise');
+    }
+    const { getOperatorKeys } = await import('./_crypto.js');
+    assert.deepEqual(getOperatorKeys(), [ENTERPRISE_KEY, 'spaced-operator-key']);
+  } finally {
+    process.env.WORLDMONITOR_VALID_KEYS = previous;
+  }
+});
+
+test('every api/ operator-key reader uses the shared trimming parser', async () => {
+  for (const rel of ['./_api-key.js', './_oauth-token.js', './mcp/auth.ts', './oauth/authorize.js', './oauth/token.ts']) {
+    const source = await readFile(new URL(rel, import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /WORLDMONITOR_VALID_KEYS\s*\|\|/, `${rel} must call getOperatorKeys()`);
   }
 });
 

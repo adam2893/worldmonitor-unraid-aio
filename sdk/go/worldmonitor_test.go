@@ -132,6 +132,35 @@ func TestListToolsIsKeyless(t *testing.T) {
 	}
 }
 
+func TestGetSourcesIsKeyless(t *testing.T) {
+	client, calls := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"sources":[]}}`)
+	})
+	result, err := client.CallTool(context.Background(), "get_sources", Args{"view": "summary"})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if string(result) != `{"sources":[]}` {
+		t.Fatalf("result = %s", result)
+	}
+	call := (*calls)[0]
+	if got := call.headers.Get(APIKeyHeader); got != "" {
+		t.Fatalf("unexpected API key header %q", got)
+	}
+	var rpc struct {
+		Params struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(call.body, &rpc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if rpc.Params.Name != "get_sources" || rpc.Params.Arguments["view"] != "summary" {
+		t.Fatalf("params = %+v", rpc.Params)
+	}
+}
+
 func TestMCPErrorWinsOverHTTP200(t *testing.T) {
 	client, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":1,"error":{"code":%d,"message":"auth required"}}`, MCPAuthErrorCode)
@@ -229,5 +258,32 @@ func TestNonJSONBodyIsWrappedAsJSONString(t *testing.T) {
 	var s string
 	if err := json.Unmarshal(result, &s); err != nil || s != "plain text" {
 		t.Fatalf("result = %s (err %v)", result, err)
+	}
+}
+
+func TestRedirectsAreNotFollowed(t *testing.T) {
+	var leaked []string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked = append(leaked, r.Header.Get(APIKeyHeader))
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+	}))
+	t.Cleanup(target.Close)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(origin.Close)
+	client := &Client{APIKey: "wm_k", BaseURL: origin.URL, MCPURL: origin.URL + "/mcp", HTTPClient: &http.Client{}}
+
+	_, rpcErr := client.ListTools(context.Background())
+	_, getErr := client.Get(context.Background(), "/api/health", nil)
+	for name, err := range map[string]error{"ListTools": rpcErr, "Get": getErr} {
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTemporaryRedirect {
+			t.Fatalf("%s: err = %v, want APIError 307", name, err)
+		}
+	}
+	if len(leaked) != 0 {
+		t.Fatalf("redirect target received %d request(s) carrying keys %q", len(leaked), leaked)
 	}
 }

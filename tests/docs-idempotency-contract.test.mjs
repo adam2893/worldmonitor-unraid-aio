@@ -1,3 +1,6 @@
+// These text checks pin Idempotency-Key documentation against OpenAPI, route
+// exceptions, and handler wiring (#8690, section 2).
+// Handler tests exercise replay behavior, but cannot verify published prose.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -165,7 +168,16 @@ describe('docs Idempotency-Key prose contract', () => {
     const notifyDocs = sectionForEndpoint(notificationsDocs, 'POST /api/notify');
     const notifyException = routeExceptions.exceptions.find((entry) => entry.path === 'api/notify.ts');
     assert.match(notifySource, /validateBearerToken/, 'notify handler validates Clerk bearer tokens');
-    assert.match(notifySource, /features\.tier\s*<\s*1/, 'notify handler requires PRO entitlement');
+    assert.match(
+      notifySource,
+      /checkTierProEntitlement\(session\.userId,\s*cors\)/,
+      'notify handler requires the tier-backed PRO entitlement used by notification delivery',
+    );
+    assert.match(
+      notifySource,
+      /if\s*\(!proAccess\.allowed\)/,
+      'notify handler denies callers that do not satisfy the shared PRO entitlement check',
+    );
     assert.equal(notifyException?.category, 'internal-helper', 'notify route registry category');
     assert.match(
       notifyException?.reason ?? '',

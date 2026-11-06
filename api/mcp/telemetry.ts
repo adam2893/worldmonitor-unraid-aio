@@ -68,6 +68,11 @@ export const MCP_TOOLS_LIST_TELEMETRY_KEYS = Object.freeze([
   'tools_array_bytes',
   'tool_count',
   'client_user_agent',
+  // MCP `initialize` params.clientInfo.name (bounded, printable ASCII) and its
+  // AI client bucket from shared/agent-client-source.js. Software identity
+  // only, never request content: counts MCP connections by client.
+  'client_name',
+  'client_source',
 ] as const);
 
 export const MCP_RATE_LIMIT_HIT_TELEMETRY_KEYS = Object.freeze([
@@ -103,7 +108,13 @@ export const MCP_DOWNSTREAM_TELEMETRY_KEYS = Object.freeze([
 //              material; mirrors `principal_id` in
 //              server/_shared/usage-identity.ts).
 export function principalIdForLog(context: McpAuthContext): string {
-  return context.kind === 'env_key' ? hashKeySync(context.apiKey) : context.userId;
+  if (context.kind === 'env_key') return hashKeySync(context.apiKey);
+  // U7: a free-tier caller has no principal to attribute. 'anon' matches the
+  // value the anonymous discovery path already logs, so free-tier tool calls
+  // aggregate with the rest of the unauthenticated traffic instead of
+  // appearing as a distinct phantom principal.
+  if (context.kind === 'free') return 'anon';
+  return context.userId;
 }
 
 export function emitMcpRateLimitHit(

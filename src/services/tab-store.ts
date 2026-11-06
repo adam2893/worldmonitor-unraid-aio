@@ -24,6 +24,16 @@ export interface TabsState {
   tabs: PanelTab[];
 }
 
+/** Matches the dashboard tab rename input (`maxLength` on the visible control). */
+export const DASHBOARD_TAB_NAME_MAX_LENGTH = 40;
+
+/**
+ * Stable tab IDs from `generateTabId()`. Agents must use these, never display names.
+ * `Date.now().toString(36)` and the random suffix are lowercase base36.
+ */
+export const DASHBOARD_TAB_ID_PATTERN = '^tab-[a-z0-9]+-[a-z0-9]+$';
+export const DASHBOARD_TAB_ID_RE = new RegExp(DASHBOARD_TAB_ID_PATTERN);
+
 // Per-variant key: each variant has its own default panel set, so tabs
 // built on one variant must not leak into another.
 const TABS_STORAGE_KEY = `worldmonitor-tabs-v1:${SITE_VARIANT}`;
@@ -32,31 +42,52 @@ export function generateTabId(): string {
   return `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+export function isDashboardTabId(value: unknown): value is string {
+  return typeof value === 'string' && DASHBOARD_TAB_ID_RE.test(value);
+}
+
+/**
+ * Shape-check a decoded tabs payload the way `loadTabsState` does for the
+ * stored one: drop malformed tabs, fall back to the first tab when the active
+ * id is unknown, and return null when nothing usable remains. Shared with the
+ * settings import so a backup is admitted under the same rules the app reads
+ * storage with, rather than a second, drifting copy of them.
+ */
+export function normalizeTabsState(parsed: unknown): TabsState | null {
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as TabsState).tabs)) return null;
+  const candidate = parsed as TabsState;
+  const tabs = candidate.tabs.filter((t): t is PanelTab =>
+    !!t && typeof t.id === 'string' && typeof t.name === 'string'
+    && !!t.panelSettings && typeof t.panelSettings === 'object'
+    && Array.isArray(t.panelOrder) && Array.isArray(t.bottomSet));
+  if (tabs.length === 0) return null;
+  const activeTabId = tabs.some((t) => t.id === candidate.activeTabId)
+    ? candidate.activeTabId
+    : tabs[0]!.id;
+  return { activeTabId, tabs };
+}
+
 export function loadTabsState(): TabsState | null {
   try {
     const raw = localStorage.getItem(TABS_STORAGE_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as TabsState;
-    if (!parsed || !Array.isArray(parsed.tabs)) return null;
-    const tabs = parsed.tabs.filter((t): t is PanelTab =>
-      !!t && typeof t.id === 'string' && typeof t.name === 'string'
-      && !!t.panelSettings && typeof t.panelSettings === 'object'
-      && Array.isArray(t.panelOrder) && Array.isArray(t.bottomSet));
-    if (tabs.length === 0) return null;
-    const activeTabId = tabs.some((t) => t.id === parsed.activeTabId)
-      ? parsed.activeTabId
-      : tabs[0]!.id;
-    return { activeTabId, tabs };
+    return normalizeTabsState(JSON.parse(raw));
   } catch {
     return null;
   }
 }
 
-export function saveTabsState(state: TabsState): void {
+export interface TabsPersistReceipt {
+  persisted: boolean;
+}
+
+export function saveTabsState(state: TabsState): TabsPersistReceipt {
   try {
     localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(state));
+    return { persisted: true };
   } catch {
     // Storage unavailable (private mode / quota) — tabs still work this session.
+    return { persisted: false };
   }
 }
 

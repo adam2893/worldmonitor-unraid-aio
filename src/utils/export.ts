@@ -3,15 +3,19 @@ import type { PredictionMarket } from '@/services/prediction';
 import type { IntelligenceCache } from '@/app/app-context';
 import type { GpsJamData } from '@/services/gps-interference';
 import type { ConvergenceCard } from '@/services/correlation-engine';
+import { vesselTypeLabel } from '@/utils/vessel-type-label';
 import { t } from '@/services/i18n';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+import { showToast } from '@/utils/toast';
+import { buildDataReportDocument, printReportDocument, sanitizeExportData } from '@/utils/export-report';
+import { SUPPORTED_EXPORT_FORMATS, type DataExportFormat } from '@/services/gates/export-resolver';
 
 // Iran-events domain sunset (war ended 2026-07). Default OFF: omit the IRAN
 // EVENTS CSV block. Set VITE_ENABLE_IRAN_ATTACKS=true to restore. Guarded so
 // node:test never dereferences import.meta.env.
 const IRAN_ATTACKS_ENABLED = typeof window !== 'undefined' && import.meta.env.VITE_ENABLE_IRAN_ATTACKS === 'true';
 
-type ExportFormat = 'json' | 'csv';
+type ExportFormat = DataExportFormat;
 
 export interface ExportMeta {
   exportedAt: string;
@@ -33,47 +37,31 @@ export interface ExportData {
   monitors?: Monitor[];
 }
 
-// Strip LLM-derived threat annotations so AI does not feed back into itself.
-// Keyword and ML (local model) classifications are retained.
-function sanitizeNewsItem(item: NewsItem): NewsItem {
-  if (item.threat?.source !== 'llm') return item;
-  const { threat: _t, ...rest } = item;
-  return rest as NewsItem;
-}
-
-function sanitizeCluster(cluster: ClusteredEvent): ClusteredEvent {
-  return {
-    ...cluster,
-    threat: cluster.threat?.source === 'llm' ? undefined : cluster.threat,
-    allItems: cluster.allItems.map(sanitizeNewsItem),
-  };
-}
-
-function sanitizeData(data: ExportData): ExportData {
-  return {
-    ...data,
-    news: data.news?.map(sanitizeNewsItem),
-    newsClusters: data.newsClusters?.map(sanitizeCluster),
-    newsByCategory: data.newsByCategory
-      ? Object.fromEntries(
-          Object.entries(data.newsByCategory).map(([k, items]) => [k, items.map(sanitizeNewsItem)]),
-        )
-      : undefined,
-  };
-}
+// The LLM-annotation stripper lives in export-report.ts so all three exporters
+// (JSON, CSV, PDF) share one implementation and it can be unit-tested without
+// a DOM. Keyword and ML (local model) classifications are retained.
 
 export function exportToJSON(data: ExportData, filename = 'worldmonitor-export'): void {
-  const jsonStr = JSON.stringify(sanitizeData(data), null, 2);
+  const jsonStr = JSON.stringify(sanitizeExportData(data), null, 2);
   downloadFile(jsonStr, `${filename}.json`, 'application/json');
 }
 
+/**
+ * PDF v1 (KTD7): a printable DATA report, not a dashboard screenshot. The
+ * builder sanitizes and escapes internally; this wrapper only owns the print
+ * surface and its failure toast.
+ */
+export function exportToPDF(data: ExportData): Promise<void> {
+  return printReportDocument(buildDataReportDocument(data));
+}
+
 export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'): void {
-  const clean = sanitizeData(data);
+  const clean = sanitizeExportData(data);
   const lines: string[] = [];
 
   lines.push(`# WorldMonitor Export — ${new Date(clean.timestamp).toISOString()}`);
   lines.push('# Note: CSV is a structured summary. Use JSON export for full fidelity.');
-  if (clean.meta?.note) lines.push(`# ${clean.meta.note}`);
+  if (clean.meta?.note) lines.push(csvRow([`# ${clean.meta.note}`]));
   lines.push('');
 
   // News — prefer raw items over clusters; clusters lose individual sources
@@ -99,7 +87,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
     lines.push('=== MARKETS ===');
     lines.push('Symbol,Name,Price,Change');
     clean.markets.forEach(m => {
-      lines.push(csvRow([m.symbol, m.name, String(m.price ?? ''), String(m.change ?? '')]));
+      lines.push(csvRow([m.symbol, m.name, m.price ?? '', m.change ?? '']));
     });
     lines.push('');
   }
@@ -108,7 +96,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
     lines.push('=== PREDICTIONS ===');
     lines.push('Title,Yes Price,Volume');
     clean.predictions.forEach(p => {
-      lines.push(csvRow([p.title, String(p.yesPrice), String(p.volume ?? '')]));
+      lines.push(csvRow([p.title, p.yesPrice, p.volume ?? '']));
     });
     lines.push('');
   }
@@ -128,7 +116,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
       lines.push('=== EARTHQUAKES ===');
       lines.push('Place,Magnitude,DepthKm,OccurredAt,URL');
       intel.earthquakes.forEach(e => {
-        lines.push(csvRow([e.place, String(e.magnitude), String(e.depthKm), new Date(e.occurredAt * 1000).toISOString(), e.sourceUrl]));
+        lines.push(csvRow([e.place, e.magnitude, e.depthKm, new Date(e.occurredAt * 1000).toISOString(), e.sourceUrl]));
       });
       lines.push('');
     }
@@ -146,7 +134,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
       lines.push('=== FLIGHT DELAYS ===');
       lines.push('Airport,IATA,City,Country,DelayType,Severity,AvgDelayMin,Source');
       intel.flightDelays.forEach(d => {
-        lines.push(csvRow([d.name, d.iata, d.city, d.country, d.delayType, d.severity, String(d.avgDelayMinutes), d.source]));
+        lines.push(csvRow([d.name, d.iata, d.city, d.country, d.delayType, d.severity, d.avgDelayMinutes, d.source]));
       });
       lines.push('');
     }
@@ -155,7 +143,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
       lines.push('=== MILITARY FLIGHTS ===');
       lines.push('Callsign,HexCode,AircraftType,Operator,Country,Lat,Lon');
       intel.military.flights.forEach(f => {
-        lines.push(csvRow([f.callsign, f.hexCode, f.aircraftType, f.operator, f.operatorCountry, String(f.lat), String(f.lon)]));
+        lines.push(csvRow([f.callsign, f.hexCode, f.aircraftType, f.operator, f.operatorCountry, f.lat, f.lon]));
       });
       lines.push('');
     }
@@ -164,7 +152,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
       lines.push('=== MILITARY VESSELS ===');
       lines.push('Name,MMSI,Country,VesselType,Lat,Lon');
       intel.military.vessels.forEach(v => {
-        lines.push(csvRow([v.name, v.mmsi, v.operatorCountry, v.vesselType, String(v.lat), String(v.lon)]));
+        lines.push(csvRow([v.name, v.mmsi, v.operatorCountry, vesselTypeLabel(v), v.lat, v.lon]));
       });
       lines.push('');
     }
@@ -181,7 +169,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
     if (intel.orefAlerts) {
       lines.push('=== OREF ALERTS ===');
       lines.push('ActiveAlerts,History24h');
-      lines.push(csvRow([String(intel.orefAlerts.alertCount), String(intel.orefAlerts.historyCount24h)]));
+      lines.push(csvRow([intel.orefAlerts.alertCount, intel.orefAlerts.historyCount24h]));
       lines.push('');
     }
 
@@ -198,7 +186,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
       lines.push('=== RADIATION MONITORING ===');
       lines.push('Location,Country,Value,Unit,ObservedAt');
       intel.radiation.observations.forEach(s => {
-        lines.push(csvRow([s.location, s.country, String(s.value), s.unit, s.observedAt.toISOString()]));
+        lines.push(csvRow([s.location, s.country, s.value, s.unit, s.observedAt.toISOString()]));
       });
       lines.push('');
     }
@@ -207,7 +195,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
       lines.push('=== SATELLITE IMAGERY ===');
       lines.push('ID,Satellite,DateTime,ResolutionM,Mode');
       intel.imageryScenes.forEach(s => {
-        lines.push(csvRow([s.id, s.satellite, s.datetime, String(s.resolutionM), s.mode]));
+        lines.push(csvRow([s.id, s.satellite, s.datetime, s.resolutionM, s.mode]));
       });
       lines.push('');
     }
@@ -217,6 +205,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
       lines.push('# See JSON export for full sanctions data');
       lines.push(`TotalCount,${intel.sanctions.totalCount}`);
       lines.push(`SDNCount,${intel.sanctions.sdnCount}`);
+      lines.push(`SemaCount,${intel.sanctions.semaCount}`);
       lines.push(`NewEntries,${intel.sanctions.newEntryCount}`);
       lines.push('');
     }
@@ -256,7 +245,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
     lines.push('=== GPS JAMMING ===');
     lines.push('FetchedAt,TotalHexes,HighCount,MediumCount');
     const s = clean.gpsJamming.stats;
-    lines.push(csvRow([clean.gpsJamming.fetchedAt, String(s.totalHexes), String(s.highCount), String(s.mediumCount)]));
+    lines.push(csvRow([clean.gpsJamming.fetchedAt, s.totalHexes, s.highCount, s.mediumCount]));
     lines.push('# Per-hex data available in JSON export');
     lines.push('');
   }
@@ -265,7 +254,7 @@ export function exportToCSV(data: ExportData, filename = 'worldmonitor-export'):
     lines.push('=== SIGNAL CONVERGENCE ===');
     lines.push('Domain,Title,Score,Trend,Countries');
     clean.convergenceCards.forEach(c => {
-      lines.push(csvRow([c.domain, c.title, String(c.score), c.trend, c.countries.join(';')]));
+      lines.push(csvRow([c.domain, c.title, c.score, c.trend, c.countries.join(';')]));
     });
     lines.push('');
   }
@@ -311,6 +300,7 @@ export interface CountryEvidenceBundleInput {
   trend?: string;
   components?: CountryBriefExport['components'];
   signals?: Record<string, unknown>;
+  signalCoverageNotes?: readonly string[];
   brief?: string;
   headlines?: CountryEvidenceSourceInput[];
   generatedAt?: string;
@@ -366,7 +356,8 @@ const SIGNAL_LABELS: Record<string, string> = {
   aisDisruptions: 'AIS disruptions',
   satelliteFires: 'Satellite fires',
   radiationAnomalies: 'Radiation anomalies',
-  temporalAnomalies: 'Temporal anomalies',
+  temporalAnomalies: 'Observed country temporal anomalies',
+  globalTemporalAnomalies: 'Observed global temporal anomalies (not country-attributed)',
   cyberThreats: 'Cyber threats',
   earthquakes: 'Earthquakes',
   displacementOutflow: 'Displacement outflow',
@@ -497,7 +488,15 @@ function signalLabel(key: string): string {
 
 function buildEvidenceSignals(signals: Record<string, unknown> | undefined): CountryEvidenceSignal[] {
   if (!signals) return [];
-  return Object.entries(signals)
+  const normalized: Record<string, unknown> = { ...signals };
+  if (normalized.cyberThreats === null) normalized.cyberThreats = 'unavailable';
+  else if (normalized.cyberThreats === 0) normalized.cyberThreats = '0';
+  for (const key of ['temporalAnomalies', 'globalTemporalAnomalies']) {
+    if (key in normalized && normalized[key] === null) {
+      normalized[key] = 'unavailable';
+    }
+  }
+  return Object.entries(normalized)
     .filter(([, value]) => {
       if (typeof value === 'number') return value > 0;
       if (typeof value === 'string') return value.trim().length > 0;
@@ -556,7 +555,7 @@ function buildEvidenceSources(
 
 function buildFreshnessNotes(input: CountryEvidenceBundleInput, exportedAt: string): string[] {
   const notes: string[] = [`Exported at ${exportedAt}.`];
-  const briefGeneratedAt = normalizeIsoTimestamp(input.briefGeneratedAt ?? input.generatedAt);
+  const briefGeneratedAt = normalizeIsoTimestamp(input.briefGeneratedAt);
   if (briefGeneratedAt) {
     notes.push(`Brief generated at ${briefGeneratedAt}${input.briefCached === true ? ' from cache' : ''}.`);
   } else {
@@ -564,6 +563,10 @@ function buildFreshnessNotes(input: CountryEvidenceBundleInput, exportedAt: stri
   }
   if (!input.headlines || input.headlines.length === 0) {
     notes.push('No headline source list was available for this export.');
+  }
+  for (const note of input.signalCoverageNotes?.slice(0, 12) ?? []) {
+    const clean = sanitizeEvidenceText(note).slice(0, 1600).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    if (clean) notes.push(clean);
   }
   return notes;
 }
@@ -580,7 +583,7 @@ function escapeMarkdownLinkText(value: string): string {
 function escapeMarkdownInline(value: string): string {
   return sanitizeEvidenceText(value)
     .replace(/\s+/g, ' ')
-    .replace(/([\\`*_{}\[\]()#+\-.!|<>])/g, '\\$1');
+    .replace(/([\\`*_{}[\]()#+\-.!|<>])/g, '\\$1');
 }
 
 function renderQuotedEvidenceBlock(value: string): string[] {
@@ -590,7 +593,7 @@ function renderQuotedEvidenceBlock(value: string): string[] {
 export function buildCountryEvidenceBundle(input: CountryEvidenceBundleInput): CountryEvidenceBundle {
   const exportedAt = normalizeIsoTimestamp(input.exportedAt) ?? new Date().toISOString();
   const generatedAt = normalizeIsoTimestamp(input.generatedAt);
-  const briefGeneratedAt = normalizeIsoTimestamp(input.briefGeneratedAt ?? input.generatedAt);
+  const briefGeneratedAt = normalizeIsoTimestamp(input.briefGeneratedAt);
   const brief = sanitizeEvidenceText(input.brief);
   return {
     country: sanitizeEvidenceText(input.country),
@@ -683,14 +686,15 @@ export function renderCountryEvidenceMarkdown(bundle: CountryEvidenceBundle): st
   return lines.join('\n');
 }
 
-export function exportCountryEvidenceMarkdown(data: CountryEvidenceBundleInput): void {
+export function countryEvidenceMarkdownArtifact(data: CountryEvidenceBundleInput): import('./country-text-download').CountryTextArtifact {
   const bundle = buildCountryEvidenceBundle(data);
   const timestamp = bundle.exportedAt.replace(/[:.]/g, '-');
-  downloadFile(
-    renderCountryEvidenceMarkdown(bundle),
-    `country-evidence-${bundle.code}-${timestamp}.md`,
-    'text/markdown;charset=utf-8',
-  );
+  return { content: renderCountryEvidenceMarkdown(bundle), filename: `country-evidence-${bundle.code}-${timestamp}.md`, mimeType: 'text/markdown;charset=utf-8' };
+}
+
+export function exportCountryEvidenceMarkdown(data: CountryEvidenceBundleInput): void {
+  const artifact = countryEvidenceMarkdownArtifact(data);
+  downloadFile(artifact.content, artifact.filename, artifact.mimeType);
 }
 
 export function exportCountryBriefJSON(data: CountryBriefExport): void {
@@ -700,13 +704,13 @@ export function exportCountryBriefJSON(data: CountryBriefExport): void {
 
 export function exportCountryBriefCSV(data: CountryBriefExport): void {
   const lines: string[] = [];
-  lines.push(`Country Brief: ${data.country} (${data.code})`);
-  lines.push(`Generated: ${data.generatedAt}`);
+  lines.push(csvRow([`Country Brief: ${data.country} (${data.code})`]));
+  lines.push(csvRow([`Generated: ${data.generatedAt}`]));
   lines.push('');
   if (data.score != null) {
     lines.push(`Score,${data.score}`);
-    lines.push(`Level,${data.level || ''}`);
-    lines.push(`Trend,${data.trend || ''}`);
+    lines.push(csvRow(['Level', data.level || '']));
+    lines.push(csvRow(['Trend', data.trend || '']));
   }
   if (data.components) {
     lines.push('');
@@ -720,7 +724,7 @@ export function exportCountryBriefCSV(data: CountryBriefExport): void {
     lines.push('');
     lines.push('Signal,Count');
     for (const [k, v] of Object.entries(data.signals)) {
-      lines.push(csvRow([k, String(v)]));
+      lines.push(csvRow([k, typeof v === 'number' ? v : String(v)]));
     }
   }
   if (data.headlines && data.headlines.length > 0) {
@@ -731,14 +735,19 @@ export function exportCountryBriefCSV(data: CountryBriefExport): void {
   if (data.brief) {
     lines.push('');
     lines.push('Intelligence Brief');
-    lines.push(`"${data.brief.replace(/"/g, '""')}"`);
+    lines.push(csvRow([data.brief]));
   }
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   downloadFile(lines.join('\n'), `country-brief-${data.code}-${timestamp}.csv`, 'text/csv');
 }
 
-function csvRow(values: string[]): string {
-  return values.map(v => `"${(v || '').replace(/"/g, '""')}"`).join(',');
+function csvRow(values: (string | number)[]): string {
+  return values.map(value => {
+    if (typeof value === 'number') return `"${value}"`;
+    const text = value || '';
+    const safe = /^[\t\r\n]|^\s*[=+@-]/.test(text) ? `'${text}` : text;
+    return `"${safe.replace(/"/g, '""')}"`;
+  }).join(',');
 }
 
 function downloadFile(content: string, filename: string, mimeType: string): void {
@@ -757,8 +766,9 @@ export class ExportPanel {
   private element: HTMLElement;
   private isOpen = false;
   private getData: () => ExportData;
+  private availableFormats = new Set<DataExportFormat>();
 
-  constructor(getDataFn: () => ExportData) {
+  constructor(getDataFn: () => ExportData, formats: readonly DataExportFormat[] = SUPPORTED_EXPORT_FORMATS) {
     this.getData = getDataFn;
     this.element = document.createElement('div');
     this.element.className = 'export-panel-container';
@@ -767,10 +777,21 @@ export class ExportPanel {
       <div class="export-menu hidden">
         <button class="export-option" data-format="csv">${t('common.exportCsv')}</button>
         <button class="export-option" data-format="json">${t('common.exportJson')}</button>
+        <button class="export-option" data-format="pdf">${t('common.exportPdf')}</button>
       </div>
     `, "legacy direct innerHTML migration"));
 
+    this.setAvailableFormats(formats);
     this.setupEventListeners();
+  }
+
+  /** Update the menu in place when a live entitlement snapshot changes. */
+  public setAvailableFormats(formats: readonly DataExportFormat[]): void {
+    this.availableFormats = new Set(formats);
+    this.element.querySelectorAll<HTMLButtonElement>('.export-option').forEach((button) => {
+      const format = button.dataset.format as DataExportFormat;
+      button.hidden = !this.availableFormats.has(format);
+    });
   }
 
   private setupEventListeners(): void {
@@ -791,12 +812,41 @@ export class ExportPanel {
 
     this.element.querySelectorAll('.export-option').forEach(option => {
       option.addEventListener('click', () => {
-        const format = (option as HTMLElement).dataset.format as ExportFormat;
+        const button = option as HTMLButtonElement;
+        const format = button.dataset.format as ExportFormat;
+        if (!this.availableFormats.has(format)) return;
+        if (format === 'pdf') {
+          // The report renders and prints asynchronously, so the menu stays
+          // open with the option in a busy state until it settles — and a
+          // failure surfaces a toast instead of the source pattern's silence.
+          void this.exportPdfWithFeedback(button, menu);
+          return;
+        }
         this.export(format);
         this.isOpen = false;
         menu.classList.add('hidden');
       });
     });
+  }
+
+  private async exportPdfWithFeedback(button: HTMLButtonElement, menu: Element): Promise<void> {
+    if (button.disabled) return;
+    const label = button.textContent;
+    button.disabled = true;
+    button.classList.add('is-exporting');
+    button.textContent = t('components.exportGate.preparingPdf');
+    try {
+      await exportToPDF(this.getData());
+    } catch (err) {
+      console.warn('[export] PDF report failed:', err);
+      showToast(t('components.exportGate.pdfFailed'));
+    } finally {
+      button.disabled = false;
+      button.classList.remove('is-exporting');
+      button.textContent = label;
+      this.isOpen = false;
+      menu.classList.add('hidden');
+    }
   }
 
   private export(format: ExportFormat): void {

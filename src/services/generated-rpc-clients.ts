@@ -20,7 +20,9 @@ import type { PredictionServiceClient as PredictionServiceClientInstance } from 
 import type { RadiationServiceClient as RadiationServiceClientInstance } from '@/generated/client/worldmonitor/radiation/v1/service_client';
 import type { ResearchServiceClient as ResearchServiceClientInstance } from '@/generated/client/worldmonitor/research/v1/service_client';
 import type { ResilienceServiceClient as ResilienceServiceClientInstance } from '@/generated/client/worldmonitor/resilience/v1/service_client';
+import type { ScorecardServiceClient as ScorecardServiceClientInstance } from '@/generated/client/worldmonitor/scorecard/v1/service_client';
 import type { SanctionsServiceClient as SanctionsServiceClientInstance } from '@/generated/client/worldmonitor/sanctions/v1/service_client';
+import type { SafetyServiceClient as SafetyServiceClientInstance } from '@/generated/client/worldmonitor/safety/v1/service_client';
 import type { ScenarioServiceClient as ScenarioServiceClientInstance } from '@/generated/client/worldmonitor/scenario/v1/service_client';
 import type { SeismologyServiceClient as SeismologyServiceClientInstance } from '@/generated/client/worldmonitor/seismology/v1/service_client';
 import type { SupplyChainServiceClient as SupplyChainServiceClientInstance } from '@/generated/client/worldmonitor/supply_chain/v1/service_client';
@@ -29,18 +31,32 @@ import type { TradeServiceClient as TradeServiceClientInstance } from '@/generat
 import type { UnrestServiceClient as UnrestServiceClientInstance } from '@/generated/client/worldmonitor/unrest/v1/service_client';
 import type { WebcamServiceClient as WebcamServiceClientInstance } from '@/generated/client/worldmonitor/webcam/v1/service_client';
 import type { WildfireServiceClient as WildfireServiceClientInstance } from '@/generated/client/worldmonitor/wildfire/v1/service_client';
+import type { MarketServiceClient as MarketServiceClientCtor } from '@/generated/client/worldmonitor/market/v1/service_client';
+import { createRequestTimeoutSignal } from './timeout-signal';
 
-type RpcClientOptions = { fetch?: typeof fetch; defaultHeaders?: Record<string, string> };
+/** Derived from generated service client constructors so protoc-gen option drift fails typecheck. */
+type RpcClientOptions = NonNullable<ConstructorParameters<typeof MarketServiceClientCtor>[1]>;
 type RpcClientConstructor<T extends object> = new (baseURL: string, options?: RpcClientOptions) => T;
 type RpcClientConstructorLoader<T extends object> = () => Promise<RpcClientConstructor<T>>;
+/** Maps every public member that is not an async method to `never`, so `T extends AsyncMethodsOnly<T>` fails for it. */
+type AsyncMethodsOnly<T> = { [K in keyof T]: T[K] extends (...args: never[]) => Promise<unknown> ? T[K] : never };
 
-export function createLazyRpcClientConstructor<T extends object>(loadConstructor: RpcClientConstructorLoader<T>): RpcClientConstructor<T> {
+export function createLazyRpcClientConstructor<T extends object & AsyncMethodsOnly<T>>(loadConstructor: RpcClientConstructorLoader<T>): RpcClientConstructor<T> {
   return function LazyRpcClient(baseURL: string, options?: RpcClientOptions): T {
+    const transport = options?.fetch ?? ((...args: Parameters<typeof fetch>) => globalThis.fetch(...args));
+    const boundedOptions: RpcClientOptions = {
+      ...options,
+      fetch: (input, init) => {
+        // A final guard for adapters that merely forward fetch. Callers keep
+        // their shorter budgets; 120s also accommodates the 90s LLM path.
+        return transport(input, { ...init, signal: createRequestTimeoutSignal(input, init, 120_000) });
+      },
+    };
     let clientPromise: Promise<T> | undefined;
     const getClient = () => {
       if (!clientPromise) {
         clientPromise = loadConstructor()
-          .then((ClientCtor) => new ClientCtor(baseURL, options))
+          .then((ClientCtor) => new ClientCtor(baseURL, boundedOptions))
           .catch((error) => {
             clientPromise = undefined;
             throw error;
@@ -49,13 +65,29 @@ export function createLazyRpcClientConstructor<T extends object>(loadConstructor
       return clientPromise;
     };
 
+    // Every property read yields an invoker, because the real client is not
+    // loaded yet. That is only sound when every public member of T is an async
+    // method; a field or getter would read as a function here while its type
+    // says string or boolean (#4550). The AsyncMethodsOnly constraint rejects
+    // such clients at compile time. At runtime a bare read stays silent, so if
+    // the loaded client still drifts from its type, invoking a non-method
+    // rejects instead of resolving to the value.
+    // `then` and `toJSON` stay undefined so await and JSON.stringify treat the
+    // proxy as a plain object instead of calling an invoker.
     return new Proxy({}, {
       get(target, property, receiver) {
-        if (property === 'then') return undefined;
+        if (property === 'then' || property === 'toJSON') return undefined;
         if (typeof property === 'symbol') return Reflect.get(target, property, receiver);
         return (...args: unknown[]) => getClient().then((client) => {
           const value = (client as Record<PropertyKey, unknown>)[property];
-          return typeof value === 'function' ? value.apply(client, args) : value;
+          if (typeof value !== 'function') {
+            throw new TypeError(
+              `Lazy RPC client: "${String(property)}" is not a method on the loaded client `
+              + `(got ${value === null ? 'null' : typeof value}). Only async methods can be `
+              + 'read through the lazy proxy; access the loaded instance for fields.',
+            );
+          }
+          return value.apply(client, args);
         });
       },
     }) as T;
@@ -172,9 +204,19 @@ export const ResilienceServiceClient = createLazyRpcClientConstructor<Resilience
   return module.ResilienceServiceClient;
 });
 
+export const ScorecardServiceClient = createLazyRpcClientConstructor<ScorecardServiceClientInstance>(async () => {
+  const module = await import('@/generated/client/worldmonitor/scorecard/v1/service_client');
+  return module.ScorecardServiceClient;
+});
+
 export const SanctionsServiceClient = createLazyRpcClientConstructor<SanctionsServiceClientInstance>(async () => {
   const module = await import('@/generated/client/worldmonitor/sanctions/v1/service_client');
   return module.SanctionsServiceClient;
+});
+
+export const SafetyServiceClient = createLazyRpcClientConstructor<SafetyServiceClientInstance>(async () => {
+  const module = await import('@/generated/client/worldmonitor/safety/v1/service_client');
+  return module.SafetyServiceClient;
 });
 
 export const ScenarioServiceClient = createLazyRpcClientConstructor<ScenarioServiceClientInstance>(async () => {

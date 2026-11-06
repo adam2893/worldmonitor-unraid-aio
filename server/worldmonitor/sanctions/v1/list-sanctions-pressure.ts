@@ -6,7 +6,6 @@ import type {
 } from '../../../../src/generated/server/worldmonitor/sanctions/v1/service_server';
 
 import { getCachedJson } from '../../../_shared/redis';
-import { isCallerPremium } from '../../../_shared/premium-check';
 
 const REDIS_CACHE_KEY = 'sanctions:pressure:v1';
 const DEFAULT_MAX_ITEMS = 25;
@@ -34,24 +33,24 @@ function emptyResponse(): ListSanctionsPressureResponse {
     newEntryCount: 0,
     vesselCount: 0,
     aircraftCount: 0,
+    semaCount: 0,
   };
 }
 
 export const listSanctionsPressure: SanctionsServiceHandler['listSanctionsPressure'] = async (
-  ctx: ServerContext,
+  _ctx: ServerContext,
   req: ListSanctionsPressureRequest,
 ): Promise<ListSanctionsPressureResponse> => {
-  const isPro = await isCallerPremium(ctx.request);
-  if (!isPro) return emptyResponse();
-
   const maxItems = clampMaxItems(req.maxItems);
   try {
     const data = await getCachedJson(REDIS_CACHE_KEY, true) as ListSanctionsPressureResponse & { _state?: unknown } | null;
     if (!data?.totalCount) return emptyResponse();
-    const { _state: _discarded, ...rest } = data;
+    const { _state: _discarded, semaError, ...rest } = data;
     return {
       ...rest,
       entries: (data.entries ?? []).slice(0, maxItems),
+      semaCount: data.semaCount ?? 0,
+      ...(typeof semaError === 'string' && semaError ? { semaError } : {}),
     };
   } catch {
     return emptyResponse();

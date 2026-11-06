@@ -33,8 +33,10 @@ describe('Python SDK package (sdk/python → PyPI worldmonitor-sdk)', () => {
     assert.equal(modVersion, pkgVersion);
   });
 
-  it('sends a descriptive User-Agent (Cloudflare WAF passes it, not python-urllib)', () => {
-    assert.match(module, /USER_AGENT = "worldmonitor-python\/%s \(\+https:\/\/worldmonitor\.app\)"/);
+  it('sends a self-identifying User-Agent (Cloudflare WAF blocks the python-urllib default)', () => {
+    // Only the two properties the WAF rule depends on: it names the client and
+    // carries the product domain. The exact format string is not a contract.
+    assert.match(module, /USER_AGENT = "worldmonitor-python[^"]*worldmonitor\.app[^"]*"/);
   });
 });
 
@@ -55,8 +57,8 @@ describe('Ruby SDK package (sdk/ruby → gem worldmonitor)', () => {
     assert.match(gemspec, /require_relative "lib\/worldmonitor\/version"/);
   });
 
-  it('sends a descriptive User-Agent', () => {
-    assert.match(lib, /USER_AGENT = "worldmonitor-ruby\/#\{VERSION\} \(\+https:\/\/worldmonitor\.app\)"/);
+  it('sends a self-identifying User-Agent', () => {
+    assert.match(lib, /USER_AGENT = "worldmonitor-ruby[^"]*worldmonitor\.app[^"]*"/);
   });
 });
 
@@ -72,9 +74,61 @@ describe('Go SDK module (sdk/go → pkg.go.dev)', () => {
     assert.match(source, /^const Version = "\d+\.\d+\.\d+"$/m);
   });
 
-  it('documents the product domain and sends a descriptive User-Agent', () => {
-    assert.match(source, /https:\/\/worldmonitor\.app/);
-    assert.match(source, /const UserAgent = "worldmonitor-go\/" \+ Version \+ " \(\+https:\/\/worldmonitor\.app\)"/);
+  it('documents the product domain and sends a self-identifying User-Agent', () => {
+    assert.match(source, /const UserAgent = "worldmonitor-go[\s\S]{0,80}worldmonitor\.app/);
+  });
+});
+
+describe('Rust SDK package (sdk/rust → crates.io worldmonitor)', () => {
+  const manifest = read('sdk/rust/Cargo.toml');
+  const source = read('sdk/rust/src/lib.rs');
+
+  it('declares official identity and registry discovery metadata', () => {
+    assert.match(manifest, /^name = "worldmonitor"$/m);
+    assert.match(manifest, /^homepage = "https:\/\/worldmonitor\.app"$/m);
+    assert.match(manifest, /^repository = "https:\/\/github\.com\/koala73\/worldmonitor"$/m);
+    assert.match(manifest, /^license = "MIT"$/m);
+    assert.match(manifest, /^keywords = .*"osint".*"mcp"/m);
+    assert.ok(existsSync(join(ROOT, 'sdk/rust/LICENSE')));
+    assert.ok(existsSync(join(ROOT, 'sdk/rust/Cargo.lock')));
+    assert.match(source, /env!\("CARGO_PKG_VERSION"\)/);
+    assert.match(source, /worldmonitor-rust\//);
+  });
+
+  it('links the published Rust crate and API docs from SDK discovery pages', () => {
+    for (const path of ['docs/sdks.mdx', 'public/sdks.md', 'public/llms.txt', 'public/api/llms.txt']) {
+      const content = read(path);
+      assert.match(content, /https:\/\/crates\.io\/crates\/worldmonitor/, path);
+      assert.match(content, /https:\/\/docs\.rs\/worldmonitor\/0\.1\.0\/worldmonitor\//, path);
+      assert.match(content, /cargo add worldmonitor/, path);
+      assert.doesNotMatch(content, /not yet published|Rust SDK preparation/i, path);
+    }
+  });
+
+  it('runs native tests and verifies the package in pull request CI', () => {
+    const wf = read('.github/workflows/rust-sdk.yml');
+    assert.match(wf, /pull_request:/);
+    assert.match(wf, /cargo test --locked/);
+    assert.match(wf, /cargo package --locked/);
+    assert.doesNotMatch(wf, /id-token: write|CARGO_REGISTRY_TOKEN/);
+  });
+
+  it('requires an explicit release dispatch and publishes the verified commit with OIDC', () => {
+    const wf = read('.github/workflows/publish-rust.yml');
+    assert.match(wf, /workflow_dispatch:/);
+    assert.doesNotMatch(wf, /^  (push|pull_request):/m);
+    assert.match(wf, /dry_run:[\s\S]*?default: true/);
+    assert.match(wf, /github\.repository == 'koala73\/worldmonitor' && github\.ref == 'refs\/heads\/main'/);
+    assert.match(wf, /git merge-base --is-ancestor HEAD origin\/main/);
+    assert.match(wf, /Tag and crate version differ/);
+    assert.match(wf, /cargo publish --locked --dry-run/);
+    assert.match(wf, /needs: verify/);
+    assert.match(wf, /if: \$\{\{ !inputs\.dry_run \}\}/);
+    assert.match(wf, /ref: \$\{\{ needs\.verify\.outputs\.commit \}\}/);
+    assert.match(wf, /environment: crates-io/);
+    assert.match(wf, /rust-lang\/crates-io-auth-action@[0-9a-f]{40}/);
+    assert.match(wf, /id-token: write/);
+    assert.doesNotMatch(wf, /secrets\./);
   });
 });
 

@@ -104,14 +104,20 @@ const EXECUTE_PASSTHROUGH_FETCHES = {
   analyze_situation: [
     'POST /api/intelligence/v1/deduct-situation',
   ],
-  generate_forecasts: [
-    'POST /api/forecast/v1/get-forecasts',
-  ],
   search_flights: [
     'GET /api/aviation/v1/search-google-flights',
   ],
   search_flight_prices_by_date: [
     'GET /api/aviation/v1/search-google-dates',
+  ],
+  search_intel_history: [
+    'GET /api/intelligence/v1/search-intel-history',
+  ],
+  get_intel_timeline: [
+    'GET /api/intelligence/v1/get-intel-timeline',
+  ],
+  get_similar_events: [
+    'GET /api/intelligence/v1/get-similar-events',
   ],
   // `get_news_intelligence` is a cache tool in api/mcp.ts (uses
   // _cacheKeys), NOT an _execute tool. Listed here in plan prose for

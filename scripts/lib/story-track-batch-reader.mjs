@@ -1,5 +1,5 @@
 /**
- * Chunked HGETALL reader for story:track:v1:<hash> rows used by
+ * Chunked field reader for story:track:v1:<hash> rows used by
  * scripts/seed-digest-notifications.mjs::buildDigest and
  * scripts/seed-forecast-resolutions.mjs::readDigestAccumulatorArchive.
  *
@@ -7,15 +7,27 @@
  * unit-tested without dragging the cron's top-level side effects
  * (Upstash creds check, main() entry-point) into the test runtime.
  *
- * Why chunked:
+ * Why chunked — timeout and memory, NOT Upstash's size limit:
  *   Per-language `digest:accumulator:v1:full:<lang>` ZSETs hold
  *   17K-21K hashes today, bounded only by ingest volume ×
  *   DIGEST_ACCUMULATOR_TTL. Each story:track:v1 hash averages ~380B
- *   but reaches ~1.2KB. An unbatched pipeline RESPONSE for the
+ *   but reaches ~1.2KB. An unbatched pipeline response for the
  *   largest accumulator already crosses 7MB and grows linearly with
- *   ingest. 500 commands × ~1.2KB = ~600KB per chunk keeps each
- *   /pipeline call's response well under Upstash's per-request
- *   limit (50MB on our plan) and inside the 10-15s pipeline timeout.
+ *   ingest, which is a latency and heap problem well before it is
+ *   anything else: 500 commands × ~1.2KB = ~600KB per chunk keeps
+ *   each call inside the 10-15s pipeline timeout.
+ *
+ *   This comment used to justify the chunking with Upstash's 50MiB
+ *   max-request-size. That reason was WRONG and is corrected here so
+ *   the next reader doesn't inherit it. Measured against production
+ *   2026-08-02: the limit applies PER COMMAND, in both directions,
+ *   and never to a pipeline's aggregate. A pipeline of 8 GETs
+ *   returning 71.7MB in total succeeds; a pipeline of 60 commands
+ *   totalling a 60MB request body succeeds; only an individual
+ *   command whose own request or result crosses 50MiB is rejected.
+ *   Even a full hash returned no more than ~1.2KB, so the limit
+ *   cannot bind on this path at any chunk size. See
+ *   docs/solutions/integration-issues/upstash-max-request-size-counts-one-command-and-answers-http-200.md
  *
  * Why bail-on-failure (return null):
  *   The caller pairs `trackResults[i]` with `hashes[i]` (see
@@ -45,21 +57,40 @@
  *   timeouts.
  */
 
-export const STORY_TRACK_HGETALL_BATCH = 500;
+export const STORY_TRACK_BATCH_SIZE = 500;
+
+// Cleanup and archive accounting must distinguish an absent hash from a
+// legacy hash with none of the selected fields, using the same snapshot.
+export const HASH_FIELDS_WITH_LENGTH_SCRIPT = `
+return {redis.call('HLEN', KEYS[1]), redis.call('HMGET', KEYS[1], unpack(ARGV))}
+`;
 
 export async function readStoryTracksChunked(
   hashes,
   pipelineFn,
-  { batchSize = STORY_TRACK_HGETALL_BATCH, log = console.warn, context = 'digest' } = {},
+  { fields, batchSize = STORY_TRACK_BATCH_SIZE, log = console.warn, context = 'digest' } = {},
 ) {
+  if (!Array.isArray(fields) || fields.length === 0) throw new Error('Story-track fields are required');
   const out = [];
   for (let i = 0; i < hashes.length; i += batchSize) {
     const chunk = hashes.slice(i, i + batchSize);
     const partial = await pipelineFn(
-      chunk.map((h) => ['HGETALL', `story:track:v1:${h}`]),
+      chunk.map((h) => ['HMGET', `story:track:v1:${h}`, ...fields]),
     );
     if (Array.isArray(partial) && partial.length === chunk.length) {
-      out.push(...partial);
+      for (const row of partial) {
+        if (row?.error) {
+          out.push(row);
+          continue;
+        }
+        const values = row?.result;
+        if (!Array.isArray(values) || values.length !== fields.length ||
+            values.some(value => value !== null && typeof value !== 'string')) {
+          throw new Error('Invalid story-track HMGET response');
+        }
+        out.push({ ...row, result: fields.flatMap((field, index) =>
+          values[index] === null ? [] : [field, values[index]]) });
+      }
       continue;
     }
     const failedAt = Math.floor(i / batchSize);

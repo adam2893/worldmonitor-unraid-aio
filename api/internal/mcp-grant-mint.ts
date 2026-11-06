@@ -9,11 +9,17 @@
  *   1. Caller is the Clerk-authenticated apex page; sends Bearer JWT +
  *      JSON `{nonce}` (nonce minted by `api/oauth/authorize.js` and
  *      stored at `oauth:nonce:<n>`).
- *   2. Resolve userId via Clerk JWKS verify. 401 on miss.
+ *   2. Resolve userId via Clerk JWKS verify (local), apply the per-user
+ *      rate limit on that identity, then confirm the token's session is
+ *      still live at Clerk (the grant outlives the bearer, so a revoked
+ *      session must not be able to mint one; a limited caller must not
+ *      spend the shared Clerk quota). 401 on miss.
  *   3. Validate `oauth:nonce:<n>` exists (DO NOT consume — U5 consumes).
- *   4. Validate `oauth:client:<client_id>` exists.
- *   5. Re-validate the client's `redirect_uri` against the same
- *      allowlist DCR enforced (defense-in-depth).
+ *   4. Resolve the client: `oauth:client:<client_id>` for DCR, or the CIMD
+ *      document for a URL client_id (#9244).
+ *   5. Re-validate the client's `redirect_uri`: against the same allowlist
+ *      DCR enforced, or against the CIMD document and its host policy
+ *      (defense-in-depth).
  *   6. Check `getEntitlements(userId).features.tier >= 1` (Pro gate).
  *   7. Mint a HMAC-signed grant token over `{userId, nonce, exp:+5min}`
  *      and store a one-shot `mcp-grant:<n>` Redis record with the same
@@ -31,9 +37,20 @@
  *   - INVALID_NONCE                400  Redis nonce miss / expired
  *   - UNKNOWN_CLIENT               400  Redis client miss
  *   - INVALID_REDIRECT_URI         400  client redirect_uri no longer allowlisted
- *   - INSUFFICIENT_TIER            403  user tier < 1 or expired
+ *   - INSUFFICIENT_TIER            403  genuinely insufficient non-free tier,
+ *                                       no mcpAccess, expired, or malformed.
+ *                                       Provider-confirmed ended coverage uses
+ *                                       the restricted free-account path.
+ *   - BROWSER_MISMATCH             403  request lacks the browser-binding cookie
+ *                                       the nonce was minted with
  *   - NONCE_CLAIMED_BY_OTHER_USER  403  nonce already claimed by a different
  *                                       Clerk userId (anti-hijack — see F2)
+ *   - TIER_VERIFICATION_UNAVAILABLE 503 entitlement could not be VERIFIED, or a
+ *                                       renewal re-check is in flight. Retryable:
+ *                                       carries Retry-After +
+ *                                       X-Billing-Verification (#5622). Distinct
+ *                                       from INSUFFICIENT_TIER on purpose —
+ *                                       flattening the two is #5600.
  *   - SERVICE_UNAVAILABLE          503  Redis SETEX failure
  *   - CONFIGURATION_ERROR          500  MCP_PRO_GRANT_HMAC_SECRET unset
  *
@@ -53,11 +70,27 @@
 
 export const config = { runtime: 'edge' };
 
-import { resolveClerkSession } from '../../server/_shared/auth-session';
-import { getEntitlements } from '../../server/_shared/entitlement-check';
+import { verifyClerkSessionActive, type ClerkSessionCheck } from '../../server/auth-session';
+import { resolveVerifiedClerkSession, type ClerkSession } from '../../server/_shared/auth-session';
 // @ts-expect-error — JS module, no declaration file
-import { isAllowedRedirectUri } from '../oauth/register.js';
+import { checkRateLimit } from '../_rate-limit.js';
+import {
+  getEntitlements,
+  isEntitlementBackendConfigured,
+} from '../../server/_shared/entitlement-check';
+import {
+  checkProMcpAccess,
+  grantSessionVerificationUnavailableResponse,
+  proMcpGateDenialResponse,
+  type ProMcpEntitlement,
+} from '../../server/_shared/pro-mcp-gate';
+// @ts-expect-error — JS module, no declaration file
+import { isAllowedRedirectUri } from '../oauth/_redirect-uri.js';
 import { GrantConfigError, signGrant } from '../_mcp-grant-hmac';
+// @ts-expect-error — JS module, no declaration file
+import { requestMatchesOAuthBinding } from '../oauth/_browser-binding.js';
+// @ts-expect-error — JS module, no declaration file
+import { clientAllowsRedirectUri, resolveOAuthClient } from '../oauth/_client-metadata.js';
 
 // Fixed return URL — NOT user-controllable (anti-phishing).
 const AUTHORIZE_PRO_URL = 'https://api.worldmonitor.app/oauth/authorize-pro';
@@ -80,12 +113,14 @@ interface NonceData {
   redirect_uri: string;
   code_challenge: string;
   state?: string;
+  bind_hash?: string;
   created_at?: number;
 }
 
 interface ClientData {
   client_name?: string;
   redirect_uris?: unknown;
+  cimd?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +193,15 @@ async function rawRedisSetNxEx(key: string, value: unknown, ttlSeconds: number):
 // ---------------------------------------------------------------------------
 
 export interface MintDeps {
-  /** Resolves the Clerk userId from the request's Bearer header. Null = unauth. */
-  resolveUserId: (req: Request) => Promise<string | null>;
+  /**
+   * The bearer's identity from the local JWKS check only (no outbound call).
+   * Null = unauth; a Response = the token could not be verified (retryable).
+   */
+  resolveSession: (req: Request) => Promise<ClerkSession | Response | null>;
+  /** Per-user limit on the locally verified identity, before any Clerk call. */
+  rateLimit: (req: Request, userId: string) => Promise<Response | null>;
+  /** Is that session still live at Clerk, for this user? Runs after the limit. */
+  verifySession: (sessionId: string, userId: string) => Promise<ClerkSessionCheck>;
   /** Reads a raw `oauth:*` or `mcp-grant:*` key from Redis. Throws on transport failure. */
   redisGet: (key: string) => Promise<unknown | null>;
   /** Writes a raw `mcp-grant:*` key with TTL. Returns false on failure. */
@@ -170,14 +212,20 @@ export interface MintDeps {
    * transport failure. Caller decides whether to GET-and-compare or 503.
    */
   redisSetNxEx: (key: string, value: unknown, ttlSeconds: number) => Promise<boolean>;
-  /** Returns Pro entitlement info or null. */
-  getEntitlements: (userId: string) => Promise<{ features: { tier: number; mcpAccess?: boolean }; validUntil: number } | null>;
+  /**
+   * Returns Pro entitlement info or null. Includes the billing-verification
+   * fields, which the gate classifies (#5622) — a stub omitting them would
+   * type-check while only ever exercising the terminal branch.
+   */
+  getEntitlements: (userId: string) => Promise<ProMcpEntitlement | null>;
   /** Same allowlist DCR uses. */
   isAllowedRedirectUri: (uri: string) => boolean;
   /** Signs the wire-format grant token. Throws GrantConfigError if env unset. */
   signGrant: (payload: { userId: string; nonce: string; exp: number }) => Promise<string>;
   /** Injectable for deterministic tests. */
   now: () => number;
+  /** Fetch for CIMD client metadata documents; defaults to the global fetch. */
+  fetchClientMetadata?: typeof fetch;
 }
 
 export async function mintGrantHandler(req: Request, deps: MintDeps): Promise<Response> {
@@ -187,8 +235,22 @@ export async function mintGrantHandler(req: Request, deps: MintDeps): Promise<Re
     });
   }
 
-  const userId = await deps.resolveUserId(req);
-  if (!userId) {
+  const session = await deps.resolveSession(req);
+  if (session instanceof Response) return grantSessionVerificationUnavailableResponse();
+  // No `sid` means this is not a session token: nothing to keep live.
+  if (!session?.sessionId) {
+    return jsonError('UNAUTHENTICATED', 'A valid Clerk session is required.', 401);
+  }
+  const userId = session.userId;
+
+  // The limiter keys on the network-free identity and runs before the Clerk
+  // call, so a limited caller cannot spend the instance-wide Clerk quota.
+  const limited = await deps.rateLimit(req, userId);
+  if (limited) return limited;
+
+  const liveness = await deps.verifySession(session.sessionId, userId);
+  if (liveness === 'unavailable') return grantSessionVerificationUnavailableResponse();
+  if (liveness !== 'active') {
     return jsonError('UNAUTHENTICATED', 'A valid Clerk session is required.', 401);
   }
 
@@ -214,38 +276,67 @@ export async function mintGrantHandler(req: Request, deps: MintDeps): Promise<Re
   if (!nonceData || typeof nonceData.client_id !== 'string' || typeof nonceData.redirect_uri !== 'string') {
     return jsonError('INVALID_NONCE', 'The authorization nonce is missing or expired.', 400);
   }
-
-  let clientData: ClientData | null;
-  try {
-    clientData = (await deps.redisGet(`oauth:client:${nonceData.client_id}`)) as ClientData | null;
-  } catch {
-    return jsonError('SERVICE_UNAVAILABLE', 'Authorization storage is temporarily unavailable.', 503);
+  // The nonce must be redeemed by the browser that started the flow; otherwise
+  // a forwarded /mcp-grant link would mint the victim's grant for the
+  // attacker's redirect_uri and state.
+  if (!(await requestMatchesOAuthBinding(req, nonceData))) {
+    return jsonError('BROWSER_MISMATCH', 'This authorization was started in a different browser. Start over from your MCP client in this browser.', 403);
   }
-  if (!clientData) {
+
+  const resolved = await resolveOAuthClient(nonceData.client_id, {
+    redisGet: deps.redisGet,
+    redisSetEx: deps.redisSetEx,
+    fetch: deps.fetchClientMetadata,
+  });
+  if (!resolved.ok) {
+    if (resolved.transient) {
+      return jsonError('SERVICE_UNAVAILABLE', 'Authorization storage is temporarily unavailable.', 503);
+    }
     return jsonError('UNKNOWN_CLIENT', 'The OAuth client is not registered.', 400);
   }
+  const clientData = resolved.client as ClientData;
 
-  // Defense-in-depth: re-validate the redirect_uri the nonce committed to
-  // is still on the allowlist (DCR allowlist could be tightened post-
-  // registration — fail closed).
-  const uris = Array.isArray(clientData.redirect_uris) ? clientData.redirect_uris : [];
-  if (!uris.includes(nonceData.redirect_uri) || !deps.isAllowedRedirectUri(nonceData.redirect_uri)) {
+  // Defense-in-depth: re-validate the redirect_uri the nonce committed to.
+  // DCR: still on the global allowlist (it could be tightened post-
+  // registration — fail closed). CIMD: still in the freshly resolved
+  // document and inside the CIMD host policy, which replaces that list.
+  if (!clientAllowsRedirectUri(clientData, nonceData.redirect_uri)
+    || (!clientData.cimd && !deps.isAllowedRedirectUri(nonceData.redirect_uri))) {
     return jsonError('INVALID_REDIRECT_URI', 'The redirect URI is no longer permitted.', 400);
   }
 
   const ent = await deps.getEntitlements(userId);
   const now = deps.now();
-  // Mirror downstream MCP-edge gate: both tier ≥ 1 AND mcpAccess === true
-  // are required. Reviewer round-2 P2 — gating on tier alone here lets a
-  // tier-1 user without mcpAccess get a token row, then 401 every call.
-  if (
-    !ent ||
-    ent.features.tier < 1 ||
-    ent.features.mcpAccess !== true ||
-    ent.validUntil < now
-  ) {
-    return jsonError('INSUFFICIENT_TIER', 'A WorldMonitor Pro subscription is required.', 403);
-  }
+  // Shared with mcp-grant-context.ts and oauth/authorize-pro.ts
+  // (server/_shared/pro-mcp-gate.ts): both tier >= 1 AND mcpAccess === true are
+  // required — gating on tier alone lets a tier-1 user without mcpAccess get a
+  // token row, then 401 every call — and an entitlement that could not be
+  // VERIFIED answers the retryable 503 rather than the terminal
+  // INSUFFICIENT_TIER (#5622).
+  const gate = checkProMcpAccess(ent, now, {
+    backendConfigured: isEntitlementBackendConfigured(),
+  });
+  // #6716: a CONFIRMED free account continues the handshake.
+  //
+  // The free allowance is selected only after a user-bound credential resolves,
+  // and this is one of the four gates on the only path to that credential
+  // (a `wm_` key is not an option — convex/apiKeys.ts requires `apiAccess`,
+  // which the free plan does not have). Refusing here made the allowance
+  // reachable only by accounts that had ALREADY been Pro, while
+  // SERVER_INSTRUCTIONS advertised it to every client on `initialize`.
+  //
+  // This widens ISSUANCE only. `checkProMcpAccess` classifies confirmed free
+  // accounts (including provider-confirmed lapses) as `free_account`; the MCP
+  // dispatcher restricts that credential to cache-backed allowance tools, while
+  // `server/gateway.ts` and `server/_shared/premium-check.ts` still refuse
+  // downstream Pro execution — so the credential grants no paid capability.
+  //
+  // Every other denial kind still refuses: `insufficient_tier` (an expired or
+  // disabled paid row, or a malformed entitlement) and `billing_verification`
+  // (a retryable renewal/unverifiable read). A provider-confirmed lapse becomes
+  // `free_account`; minting on an unverifiable read would hand out credentials
+  // during an entitlement outage.
+  if (gate && gate.kind !== 'free_account') return proMcpGateDenialResponse(gate);
 
   // Mint the signed grant first (cheaper to fail before the Redis write).
   const exp = now + GRANT_TTL_MS;
@@ -329,9 +420,25 @@ export async function mintGrantHandler(req: Request, deps: MintDeps): Promise<Re
 // Production handler — wires up the real deps.
 // ---------------------------------------------------------------------------
 
+/**
+ * The limiter guards the outbound Clerk session check, so it fails closed: an
+ * unavailable limiter must not let one caller spend the shared Clerk quota.
+ */
+export function mintRateLimitPolicy(userId: string) {
+  return {
+    scope: 'mcp-grant-mint',
+    identifier: `user:${userId}`,
+    limit: 20,
+    window: '10 m',
+    failClosed: true,
+  } as const;
+}
+
 export default async function handler(req: Request): Promise<Response> {
   return mintGrantHandler(req, {
-    resolveUserId: async (r) => (await resolveClerkSession(r))?.userId ?? null,
+    resolveSession: resolveVerifiedClerkSession,
+    rateLimit: (request, userId) => checkRateLimit(request, NO_STORE_JSON, mintRateLimitPolicy(userId)),
+    verifySession: verifyClerkSessionActive,
     redisGet: rawRedisGet,
     redisSetEx: rawRedisSetEx,
     redisSetNxEx: rawRedisSetNxEx,

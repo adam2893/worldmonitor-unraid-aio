@@ -1,19 +1,12 @@
-import type { MarketServiceClient } from '@/generated/client/worldmonitor/market/v1/service_client';
 import { Panel } from './Panel';
+import { createLazyClient, getRpcBaseUrl } from '@/services/rpc-client';
+import { MarketServiceClient } from '@/services/generated-rpc-clients';
 import { t } from '@/services/i18n';
 import { escapeHtml, unsafeRawHtml } from '@/utils/sanitize';
 import { formatChange, getChangeClass } from '@/utils';
+import { proFreshRpcFetch } from '@/services/premium-fetch';
 
-let _client: MarketServiceClient | null = null;
-
-async function getMarketClient(): Promise<MarketServiceClient> {
-  if (!_client) {
-    const { MarketServiceClient } = await import('@/generated/client/worldmonitor/market/v1/service_client');
-    const { getRpcBaseUrl } = await import('@/services/rpc-client');
-    _client = new MarketServiceClient(getRpcBaseUrl(), { fetch: (...args: Parameters<typeof fetch>) => globalThis.fetch(...args) });
-  }
-  return _client;
-}
+const getMarketClient = createLazyClient(() => new MarketServiceClient(getRpcBaseUrl(), { fetch: proFreshRpcFetch }));
 
 const TOP_STOCKS = ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA'];
 const COT_PRIORITY = ['CL', 'GC', 'SI', 'ES', 'NQ'];
@@ -62,7 +55,7 @@ export class LiquidityShiftsPanel extends Panel {
   public async fetchData(): Promise<boolean> {
     this.showLoading();
     try {
-      const client = await getMarketClient();
+      const client = getMarketClient();
       const [cotResp, stocksResp] = await Promise.all([
         client.getCotPositioning({}),
         client.listMarketQuotes({ symbols: TOP_STOCKS }),
@@ -84,6 +77,8 @@ export class LiquidityShiftsPanel extends Panel {
         const net = pct(longPos, shortPos);
         const levLong = toNum(row.leveragedFundsLong ?? 0);
         const levShort = toNum(row.leveragedFundsShort ?? 0);
+        const smallLong = toNum(row.smallTraderLong ?? 0);
+        const smallShort = toNum(row.smallTraderShort ?? 0);
         // CFTC Disaggregated report (GC/SI/CL) has no Leveraged Funds
         // category — only TFF report (ES/NQ) does. Skip the sub-line entirely
         // rather than render a misleading "Lev +0.0%" for commodity rows.
@@ -94,6 +89,11 @@ export class LiquidityShiftsPanel extends Panel {
         const levLine = hasLev
           ? `<div class="market-symbol">${t('components.liquidityShifts.lev')} ${escapeHtml(formatLevShift(levNet))}</div>`
           : '';
+        const hasSmall = row.smallTraderAvailable === true;
+        const smallNet = hasSmall ? pct(smallLong, smallShort) : null;
+        const smallLine = hasSmall
+          ? `<div class="market-symbol">Small traders ${escapeHtml(formatLevShift(smallNet))}</div>`
+          : '';
 
         return `<div class="liquidity-row">
           <div class="liquidity-row__info">
@@ -103,6 +103,7 @@ export class LiquidityShiftsPanel extends Panel {
           <div class="liquidity-row__values">
             <div>${renderShiftPill(net)}</div>
             ${levLine}
+            ${smallLine}
           </div>
         </div>`;
       }).join('');
@@ -131,7 +132,7 @@ export class LiquidityShiftsPanel extends Panel {
       const emptyCot = `<div class="market-symbol">${t('components.liquidityShifts.noCot')}</div>`;
       const emptyStocks = `<div class="market-symbol">${t('components.liquidityShifts.noStocks')}</div>`;
       const reportDateLine = cotResp.reportDate
-        ? `<div class="market-symbol liquidity-report-date">${t('components.liquidityShifts.reportDate', { date: cotResp.reportDate })}</div>`
+        ? `<div class="market-symbol liquidity-report-date">${escapeHtml(t('components.liquidityShifts.reportDate', { date: cotResp.reportDate }))}</div>`
         : '';
 
       this.setSafeContent(unsafeRawHtml(`

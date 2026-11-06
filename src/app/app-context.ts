@@ -1,8 +1,10 @@
+import type { BreakerDataState } from '@/utils/circuit-breaker';
 import type { InternetOutage, SocialUnrestEvent, MilitaryFlight, MilitaryFlightCluster, MilitaryVessel, MilitaryVesselCluster, USNIFleetReport, PanelConfig, MapLayers, NewsItem, MarketData, ClusteredEvent, CyberThreat, Monitor, AisDisruptionEvent } from '@/types';
 import type { AirportDelayAlert, PositionSample } from '@/services/aviation';
 import type { IranEvent } from '@/generated/client/worldmonitor/conflict/v1/service_client';
 import type { ConflictEvent } from '@/services/conflict';
 import type { GpsJamHex } from '@/services/gps-interference';
+import type { OverlayId } from '@/utils/overlay-history';
 
 // Geometry-resolved satellite-fire shape ingested into CII. Mirrors the inline
 // projection built in DataLoaderManager.loadFirmsData so the cache can replay it
@@ -25,7 +27,13 @@ import type { UnifiedSettingsTabId } from '@/components/settings-types';
 export type { UnifiedSettingsTabId };
 
 export interface UnifiedSettingsController {
-  open(tab?: UnifiedSettingsTabId): void;
+  open(
+    tab?: UnifiedSettingsTabId,
+    replaceOverlayId?: OverlayId,
+    historyPending?: boolean,
+  ): void | Promise<boolean>;
+  close(): void;
+  hasPendingChanges(): boolean;
   refreshPanelToggles(): void;
   getButton(): HTMLButtonElement;
   destroy(): void;
@@ -33,10 +41,10 @@ export interface UnifiedSettingsController {
 
 export interface IntelligenceCache {
   conflicts?: ConflictEvent[];
-  // Coordinate-resolved sources whose CII attribution depends on precision
+  // Coordinate-resolved sources whose country-detail attribution depends on precision
   // country geometry. They are ingested during the visible-data fan-out (before
   // geometry is ready, so attribution is coarse/empty) and replayed once
-  // geometry lands — see refreshGeometryDependentCiiAfterCountryGeometry (#4512).
+  // geometry lands — see refreshGeometryDependentCountryData (#4512).
   gpsJamming?: GpsJamHex[];
   aisDisruptions?: AisDisruptionEvent[];
   satelliteFires?: SatelliteFireSignal[];
@@ -45,7 +53,7 @@ export interface IntelligenceCache {
   aircraftPositions?: PositionSample[];
   outages?: InternetOutage[];
   protests?: { events: SocialUnrestEvent[]; sources: { acled: number; gdelt: number } };
-  military?: { flights: MilitaryFlight[]; flightClusters: MilitaryFlightCluster[]; vessels: MilitaryVessel[]; vesselClusters: MilitaryVesselCluster[] };
+  military?: { flights: MilitaryFlight[]; flightClusters: MilitaryFlightCluster[]; vessels: MilitaryVessel[]; vesselClusters: MilitaryVesselCluster[]; flightDataState?: BreakerDataState; vesselDataState?: BreakerDataState; vesselNegativeEvidenceConfirmed?: boolean; vesselCoverageNotes?: string[] };
   earthquakes?: Earthquake[];
   usniFleet?: USNIFleetReport;
   iranEvents?: IranEvent[];
@@ -64,6 +72,14 @@ export interface AppContext {
 
   panels: Record<string, import('@/components').Panel>;
   newsPanels: Record<string, import('@/components').NewsPanel>;
+  /**
+   * `feed category key → the panel key its NewsPanel registered under`, filled
+   * by panel-layout as it registers news panels. A category whose key was
+   * already claimed by a non-news panel never lands here, which is what stops
+   * the data layer resolving it as a news category (#5376). See
+   * `enabledNewsCategoryKeys` in src/config/feed-resolution.ts.
+   */
+  newsCategoryPanelKeys: Map<string, string>;
   panelSettings: Record<string, PanelConfig>;
 
   mapLayers: MapLayers;
@@ -115,8 +131,17 @@ export interface AppContext {
   isPlaybackMode: boolean;
   isIdle: boolean;
   initialLoadComplete: boolean;
+  /**
+   * A clustering pass has completed successfully at least once, so `latestClusters`
+   * is an answer rather than "not computed yet". Distinct from `initialLoadComplete`,
+   * which is set before the clustering pass begins. Never reset: once a pass has
+   * settled, a later in-flight pass still leaves the previous clusters on screen.
+   */
+  clustersSettled: boolean;
   resolvedLocation: 'global' | 'america' | 'mena' | 'eu' | 'asia' | 'latam' | 'africa' | 'oceania';
   activeChokepoint: string | null;
+  /** A ?country deep link whose brief has not opened yet; the URL keeps it meanwhile. */
+  pendingCountryBrief: { code: string; expanded: boolean } | null;
 
   initialUrlState: import('@/utils').ParsedMapUrlState | null;
   readonly PANEL_ORDER_KEY: string;

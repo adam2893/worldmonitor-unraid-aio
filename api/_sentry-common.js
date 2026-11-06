@@ -72,7 +72,18 @@ function parseStack(stack) {
  */
 function buildEnvelope(err, ctx, runtimeCfg) {
   const errMsg = err instanceof Error ? err.message : String(err);
-  const errType = err instanceof Error ? err.constructor.name : 'Error';
+  // Prefer `err.name` over `err.constructor.name`. Both API bundles ship
+  // minified, so a custom error class's constructor name is a mangled
+  // identifier that changes whenever the bundle is rebuilt: `RpcValidationError`
+  // reached Sentry as type `At` (WORLDMONITOR-Y2, 2026-08-21), titling the issue
+  // `At: get-country-risk HTTP 400`. Every class here sets `this.name`
+  // explicitly, and `api/mcp/error-fingerprint.ts` already keys on it, so
+  // `err.name` is both stable across deploys and the value the code intends.
+  // Native errors are unaffected except DOMException, which reports its reason
+  // (`TimeoutError`) instead of the generic class — strictly more specific.
+  const errType = err instanceof Error
+    ? (err.name || err.constructor.name || 'Error')
+    : 'Error';
   const stack = err instanceof Error && err.stack ? err.stack : undefined;
   const eventId = crypto.randomUUID().replace(/-/g, '');
   const timestamp = new Date().toISOString();
@@ -117,8 +128,10 @@ function buildEnvelope(err, ctx, runtimeCfg) {
   return `${header}\n${itemHeader}\n${itemPayload}\n`;
 }
 
+// Resolves true only when Sentry accepted the envelope, so a caller that must
+// not lose an event (health source incidents) can retry it. Never rejects.
 async function deliver(body, logPrefix) {
-  if (!_envelopeUrl || !_key) return;
+  if (!_envelopeUrl || !_key) return false;
   try {
     // `keepalive: true` is critical for Vercel edge runtime: when a
     // handler returns a Response, the V8 isolate can be torn down
@@ -147,11 +160,13 @@ async function deliver(body, logPrefix) {
             : ' — Sentry outage or transient error';
       console.warn(`${logPrefix} non-2xx response ${res.status}${hint}`);
     }
+    return res.ok;
   } catch (fetchErr) {
     console.warn(
       `${logPrefix} failed to deliver event:`,
       fetchErr instanceof Error ? fetchErr.message : fetchErr,
     );
+    return false;
   }
 }
 
@@ -179,7 +194,7 @@ async function deliver(body, logPrefix) {
 export function makeCaptureSilentError({ runtime, platform, logPrefix }) {
   const runtimeCfg = { runtime, platform };
   return function captureSilentError(err, opts) {
-    if (!_envelopeUrl || !_key) return Promise.resolve();
+    if (!_envelopeUrl || !_key) return Promise.resolve(false);
     const promise = deliver(buildEnvelope(err, opts, runtimeCfg), logPrefix);
     if (opts?.ctx && typeof opts.ctx.waitUntil === 'function') {
       opts.ctx.waitUntil(promise);

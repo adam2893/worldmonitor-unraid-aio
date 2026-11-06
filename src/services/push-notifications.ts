@@ -1,3 +1,4 @@
+import { createRequestTimeoutSignal } from '@/services/timeout-signal';
 // Web Push subscription lifecycle (Phase 6).
 //
 // Tiny wrapper around navigator.serviceWorker.pushManager that:
@@ -20,8 +21,9 @@
 //     we return it without re-prompting. Re-linking an already-linked
 //     device is a no-op from the user's perspective.
 
-import { getClerkToken } from '@/services/clerk';
+import { getClerkToken, getCurrentClerkUser } from '@/services/clerk';
 import { VAPID_PUBLIC_KEY, isWebPushConfigured, urlBase64ToUint8Array, arrayBufferToBase64 } from '@/config/push';
+import { isDesktopRuntime } from '@/services/desktop-runtime';
 
 export type PushPermission = 'default' | 'granted' | 'denied' | 'unsupported';
 
@@ -39,7 +41,7 @@ export type PushPermission = 'default' | 'granted' | 'denied' | 'unsupported';
  */
 export function isWebPushSupported(): boolean {
   if (typeof window === 'undefined') return false;
-  if ('__TAURI_INTERNALS__' in window || '__TAURI__' in window) return false;
+  if (isDesktopRuntime()) return false;
   if (!('serviceWorker' in navigator)) return false;
   if (!('PushManager' in window)) return false;
   if (typeof Notification === 'undefined') return false;
@@ -82,10 +84,26 @@ interface SubscriptionPayload {
   userAgent: string;
 }
 
+const SUBSCRIBE_ATTEMPTS = 3;
+const SUBSCRIBE_SETTLE_MS = 800;
+
+function endpointHost(endpoint: string): string {
+  try {
+    return new URL(endpoint).hostname;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Null when the subscription can't be registered: Chrome occasionally hands
+ * back null keys on first grant, and a revoked subscription carries a
+ * placeholder endpoint on the reserved `.invalid` TLD.
+ */
 function subscriptionToPayload(sub: PushSubscription): SubscriptionPayload | null {
   const p256dh = arrayBufferToBase64(sub.getKey('p256dh'));
   const auth = arrayBufferToBase64(sub.getKey('auth'));
-  if (!p256dh || !auth || !sub.endpoint) return null;
+  if (!p256dh || !auth || !sub.endpoint || endpointHost(sub.endpoint).endsWith('.invalid')) return null;
   return {
     endpoint: sub.endpoint,
     p256dh,
@@ -94,11 +112,24 @@ function subscriptionToPayload(sub: PushSubscription): SubscriptionPayload | nul
   };
 }
 
-async function authFetch(path: string, init: RequestInit): Promise<Response> {
+function assertExpectedAccount(expectedUserId?: string): void {
+  if (expectedUserId && getCurrentClerkUser()?.id !== expectedUserId) {
+    throw new Error('Authenticated account changed during push setup');
+  }
+}
+
+async function authFetch(
+  path: string,
+  init: RequestInit,
+  expectedUserId?: string,
+): Promise<Response> {
+  assertExpectedAccount(expectedUserId);
   const token = await getClerkToken();
   if (!token) throw new Error('Not authenticated');
+  assertExpectedAccount(expectedUserId);
   return fetch(path, {
     ...init,
+    signal: createRequestTimeoutSignal(path, init, 15_000),
     headers: {
       'Content-Type': 'application/json',
       ...(init.headers ?? {}),
@@ -112,7 +143,8 @@ async function authFetch(path: string, init: RequestInit): Promise<Response> {
  * the endpoint with the server. Resolves with the payload the server
  * accepted, or throws on cancel / denial / network failure.
  */
-export async function subscribeToPush(): Promise<SubscriptionPayload> {
+export async function subscribeToPush(expectedUserId?: string): Promise<SubscriptionPayload> {
+  assertExpectedAccount(expectedUserId);
   if (!isWebPushSupported()) {
     throw new Error('Web push is not supported in this browser.');
   }
@@ -133,40 +165,87 @@ export async function subscribeToPush(): Promise<SubscriptionPayload> {
   // sync even when the browser has a stale subscription — this is
   // important after sign-out/sign-in, where the browser's push
   // identity persists but the Convex row does not.
-  let sub = await reg.pushManager.getSubscription();
-  if (!sub) {
-    sub = await reg.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY) as BufferSource,
-    });
-  }
-
-  const payload = subscriptionToPayload(sub);
-  if (!payload) {
-    // Chrome occasionally hands back a subscription with null keys on
-    // first-grant. Unsubscribe and retry once.
-    await sub.unsubscribe().catch(() => {});
-    const retry = await reg.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY) as BufferSource,
-    });
-    const retryPayload = subscriptionToPayload(retry);
-    if (!retryPayload) throw new Error('Failed to extract push subscription keys.');
-    await postSubscription(retryPayload);
-    return retryPayload;
-  }
-
-  await postSubscription(payload);
+  const payload = await obtainSubscriptionPayload(reg.pushManager, {
+    userVisibleOnly: true,
+    applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY) as BufferSource,
+  });
+  await postSubscription(payload, expectedUserId);
   return payload;
 }
 
-async function postSubscription(payload: SubscriptionPayload): Promise<void> {
+/**
+ * Return a registrable subscription, replacing an unusable one. Right after
+ * unsubscribe() Chromium can answer subscribe() with the revoked placeholder
+ * again, so each replacement waits before subscribing.
+ */
+export async function obtainSubscriptionPayload(
+  pushManager: PushManager,
+  options: PushSubscriptionOptionsInit,
+  settle: () => Promise<void> = () => new Promise((resolve) => setTimeout(resolve, SUBSCRIBE_SETTLE_MS)),
+): Promise<SubscriptionPayload> {
+  let sub = await pushManager.getSubscription();
+  for (let attempt = 0; ; attempt++) {
+    const payload = sub && subscriptionToPayload(sub);
+    if (payload) return payload;
+    if (attempt === SUBSCRIBE_ATTEMPTS) throw new Error('Failed to obtain a usable push subscription.');
+    if (sub) {
+      await sub.unsubscribe().catch(() => {});
+      await settle();
+    }
+    sub = await pushManager.subscribe(options);
+  }
+}
+
+/** Carries the endpoint's hostname (never its path, which holds the registration token). */
+export class PushRegistrationError extends Error {
+  readonly endpointHost: string;
+
+  constructor(message: string, endpointHost: string) {
+    super(message);
+    this.endpointHost = endpointHost;
+  }
+}
+
+/**
+ * Shape the error thrown when `/api/notification-channels` rejects a
+ * subscription.
+ *
+ * Every rejection on that route answers with a distinct `error` code —
+ * `endpoint host is not a recognised push service`, `pro_required`,
+ * `Invalid JSON body`, `MISSING_USER_ID`, … — but the throw used to carry only
+ * the HTTP status. That made WORLDMONITOR-XR (3 events / 2 users, Chrome on
+ * macOS) permanently undiagnosable: a bare "(400)" cannot distinguish an
+ * unrecognised push host from a malformed body from an entitlement denial, and
+ * the response was already discarded by the time Sentry saw it.
+ *
+ * Only a JSON `error` string is appended, so the message stays bounded to the
+ * route's own fixed code set — a proxy/CDN HTML interstitial can't blow up
+ * Sentry's issue cardinality with one group per body.
+ */
+export async function describePushRegistrationFailure(
+  res: Pick<Response, 'status' | 'text'>,
+): Promise<string> {
+  let code = '';
+  try {
+    const parsed: unknown = JSON.parse(await res.text());
+    const error = (parsed as { error?: unknown } | null)?.error;
+    if (typeof error === 'string' && error) code = error.slice(0, 120);
+  } catch {
+    // Non-JSON body (or an unreadable stream) — the status is all we have.
+  }
+  return `Failed to register push subscription (${res.status})${code ? `: ${code}` : ''}.`;
+}
+
+async function postSubscription(
+  payload: SubscriptionPayload,
+  expectedUserId?: string,
+): Promise<void> {
   const res = await authFetch('/api/notification-channels', {
     method: 'POST',
     body: JSON.stringify({ action: 'set-web-push', ...payload }),
-  });
+  }, expectedUserId);
   if (!res.ok) {
-    throw new Error(`Failed to register push subscription (${res.status}).`);
+    throw new PushRegistrationError(await describePushRegistrationFailure(res), endpointHost(payload.endpoint));
   }
 }
 

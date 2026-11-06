@@ -14,6 +14,18 @@ the committed fixtures produces byte-identical numbers.
 | `medium-get-conflict-events.response.json` | `get_conflict_events` | medium (~2–5 KB raw) |
 | `thin-get-chokepoint-status.response.json` | `get_chokepoint_status` | thin (~0.5–1 KB raw) |
 
+Three more production payloads back the default-call budget checks in
+`tests/mcp-output-budget.test.mjs` and `tests/mcp-default-call-budgets.test.mjs`.
+Each was over its tool's `_outputBudgetBytes` on 2026-10-16. They were
+assembled from in-budget `jmespath` slices of the live argument-free call;
+each reassembled file serializes to the exact byte count production reported.
+
+| File | Tool | Production bytes |
+|---|---|---|
+| `rpc-generate-forecasts.response.json` | `generate_forecasts` (`_execute` result; retired, still callable) | 85,985 |
+| `oversized-get-natural-disasters.response.json` | `get_natural_disasters` | 158,957 |
+| `oversized-get-imd-cyclone-marine.response.json` | `get_imd_cyclone_marine` | 98,859 |
+
 ## How to (re)capture
 
 ```bash
@@ -59,7 +71,7 @@ this feature.
 `executeTool()` reads cache via `readJsonFromUpstash` which calls
 `fetch()` directly, not `deps.redisPipeline`. Mocking `deps` doesn't
 intercept the cache reads, so we'd have to mock `globalThis.fetch`
-keyed by each tool's `_cacheKeys + _seedMetaKey` to get the cache path
+keyed by each tool's `_cacheKeys + _freshnessChecks[].key` to get the cache path
 to feed our fixtures. Calling `applyJmespath` directly on the
 already-assembled tool response is simpler AND uniquely correct for
 what we measure — the projection delta, not the cache-path overhead.

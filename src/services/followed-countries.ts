@@ -43,10 +43,11 @@ import {
 } from './entitlements';
 import { getCurrentClerkUser as _getCurrentClerkUser } from './clerk';
 import { subscribeAuthState as _subscribeAuthState } from './auth-state';
+import { isSelfHostedRuntime } from '@/config/self-host-runtime';
 import {
   getConvexClient as _getConvexClient,
   getConvexApi as _getConvexApi,
-  waitForConvexAuth as _waitForConvexAuth,
+  waitForConvexAuthForUser as _waitForConvexAuthForUser,
 } from './convex-client';
 import type {
   FollowMutationResult as ServerFollowMutationResult,
@@ -189,15 +190,17 @@ let _convexApiGetter: () => Promise<ConvexApiLike | null> = async () =>
  * was previously classified as PERMANENT, which clears localStorage
  * and loses the anonymous follows on every transient auth lag.
  *
- * Resolves to `true` when Convex auth lands; `false` if it doesn't
- * within the timeout window (which still falls through to the
- * mergeAnonymousLocal call — the catch path now treats UNAUTHENTICATED
- * as transient and the visibilitychange retry will succeed once
- * Convex catches up).
+ * Resolves to `true` when Convex auth lands for the captured Clerk user;
+ * `false` if it does not. A false result schedules the normal transient
+ * retry instead of letting another account's shared client perform the merge.
  */
-let _waitForConvexAuthFn: (timeoutMs?: number) => Promise<boolean> = (
+let _waitForConvexAuthFn: (
+  userId: string,
+  timeoutMs?: number,
+) => Promise<boolean> = (
+  userId,
   timeoutMs,
-) => _waitForConvexAuth(timeoutMs);
+) => _waitForConvexAuthForUser(userId, timeoutMs);
 
 /**
  * Test-only override hook. Pass `null` to restore the real
@@ -253,8 +256,10 @@ export function _setDepsForTests(deps: {
     }
   }
   if (deps.waitForConvexAuth !== undefined) {
-    _waitForConvexAuthFn =
-      deps.waitForConvexAuth ?? ((tm) => _waitForConvexAuth(tm));
+    const waitOverride = deps.waitForConvexAuth;
+    _waitForConvexAuthFn = waitOverride
+      ? (_userId, timeoutMs) => waitOverride(timeoutMs)
+      : (userId, timeoutMs) => _waitForConvexAuthForUser(userId, timeoutMs);
   }
 }
 
@@ -557,6 +562,7 @@ function dispatchCapDrop(kept: number, dropped: number): void {
  * entitlement loading.
  */
 export function serviceEntitlementState(): ServiceEntitlementState {
+  if (isSelfHostedRuntime()) return 'pro';
   const user = _clerkUserGetter();
   if (!user) return 'free';
   const ent = _entitlementStateGetter();
@@ -714,10 +720,10 @@ async function onAuthStateChange(
  * every transient auth lag. Two-part fix:
  *   (a) await `_waitForConvexAuthFn()` BEFORE the mutation call so the
  *       race usually doesn't fire at all;
- *   (b) treat UNAUTHENTICATED as transient if it still fires (e.g.,
- *       waitForConvexAuth timed out, or Convex auth dropped mid-call) —
- *       visibilitychange + max-retry path will re-attempt once Convex
- *       auth lands. UNAUTHENTICATED IS counted toward the max-retry
+ *   (b) fail closed and schedule a transient retry when the identity-bound
+ *       auth wait times out or is superseded; still treat UNAUTHENTICATED as
+ *       transient if auth drops after the guard and while the mutation is
+ *       in flight. UNAUTHENTICATED IS counted toward the max-retry
  *       budget (it's the same state-machine state as a network
  *       failure); a real persistent auth mismatch will eventually
  *       transition to 'failed-permanent' after MAX_HANDOFF_RETRIES.
@@ -758,8 +764,7 @@ async function _runHandoff(
   // Step 2: call mergeAnonymousLocal.
   let result: ServerMergeAnonymousLocalResult;
   try {
-    const client = await _convexClientGetter();
-    const api = await _convexApiGetter();
+    const [client, api] = await Promise.all([_convexClientGetter(), _convexApiGetter()]);
     if (!client || !api) {
       // Convex unavailable — treat as transient failure. Keep localStorage,
       // schedule retry on visibilitychange.
@@ -773,10 +778,15 @@ async function _runHandoff(
     // setAuth callback runs on the next event-loop tick) and the server
     // throws UNAUTHENTICATED. waitForConvexAuth resolves to true once
     // the server confirms the client is authenticated, false on timeout.
-    // On timeout we still attempt the call — the catch below will treat
-    // any resulting UNAUTHENTICATED as transient and schedule a retry.
-    await _waitForConvexAuthFn();
+    // A timeout or superseded account is transient, but must fail closed:
+    // proceeding could merge this user's local list through another user's
+    // shared Convex socket.
+    const authed = await _waitForConvexAuthFn(userIdAtStart);
     if (!_authStillMatches(userIdAtStart, gen)) return;
+    if (!authed) {
+      _markFailedAndScheduleRetry(userIdAtStart, gen);
+      return;
+    }
     result = await client.mutation(
       api.followedCountries.mergeAnonymousLocal,
       { countries: localList },
@@ -902,38 +912,6 @@ function _clearVisibilityRetryListener(): void {
   _visibilityRetryListener = null;
 }
 
-/**
- * Test-only: trigger the pending visibilitychange retry without going
- * through the real DOM event. Returns a promise that resolves when the
- * retry's handoff finishes.
- */
-export function _triggerVisibilityRetryForTests(): Promise<void> {
-  if (!_visibilityRetryListener) return Promise.resolve();
-  // The handler is sync but kicks off `_runHandoff` (async). To make
-  // tests deterministic, replicate the handler's logic with awaitable
-  // semantics here.
-  return new Promise<void>((resolve) => {
-    const handler = _visibilityRetryListener;
-    if (!handler) {
-      resolve();
-      return;
-    }
-    // We don't actually call the DOM-bound handler (which doesn't return
-    // a promise) — instead, we simulate the visibilitychange retry by
-    // capturing state and running `_runHandoff` directly. Tests rely on
-    // this awaiting completion.
-    _clearVisibilityRetryListener();
-    // We can't recover userIdAtStart/gen from the closure, so call the
-    // handler synchronously and chain on the next microtask. The handler
-    // schedules an async `_runHandoff`; we await it via a microtask flush.
-    handler();
-    // Allow the spawned _runHandoff microtask chain to settle. We use a
-    // small loop of microtask flushes; tests only need this to resolve
-    // after the mutation promise has resolved.
-    queueMicrotask(() => queueMicrotask(() => resolve()));
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Reactive subscription to listFollowed (U3)
 // ---------------------------------------------------------------------------
@@ -945,8 +923,7 @@ async function _startReactiveSubscription(
   // Idempotent — if a prior subscription is still active, replace it.
   _stopReactiveSubscription();
 
-  const client = await _convexClientGetter();
-  const api = await _convexApiGetter();
+  const [client, api] = await Promise.all([_convexClientGetter(), _convexApiGetter()]);
   if (!client || !api) {
     // No transport available (Convex disabled in this env). Subscription
     // stays empty; getFollowed() falls through to localStorage union or
@@ -1125,8 +1102,7 @@ export async function addCountry(input: string): Promise<FollowMutationResult> {
     const userIdAtStart = user.id;
     const genAtStart = _handoffGeneration;
     try {
-      const client = await _convexClientGetter();
-      const api = await _convexApiGetter();
+      const [client, api] = await Promise.all([_convexClientGetter(), _convexApiGetter()]);
       // P1 #11 — re-verify after the await. If a sign-out / user swap
       // happened, fall through to HANDOFF_PENDING (do NOT touch
       // localStorage; the new auth state's listener will handle merge).
@@ -1261,8 +1237,7 @@ export async function removeCountry(
     const userIdAtStart = user.id;
     const genAtStart = _handoffGeneration;
     try {
-      const client = await _convexClientGetter();
-      const api = await _convexApiGetter();
+      const [client, api] = await Promise.all([_convexClientGetter(), _convexApiGetter()]);
       if (!_authStillMatches(userIdAtStart, genAtStart)) {
         return { ok: false, reason: 'HANDOFF_PENDING' };
       }

@@ -30,6 +30,7 @@
 - [ ] New RSS feed domains added to `api/rss-proxy.js` allowlist (if adding feeds)
 - [ ] No API keys or secrets committed
 - [ ] TypeScript compiles without errors (`npm run typecheck`)
+- [ ] New or repointed health probes have a completed Railway-side pre-seed or a one-way durable activation marker (if applicable)
 
 ## Documentation Alignment Checklist
 

@@ -10,15 +10,17 @@ export { IDLE_PAUSE_MS } from '../idle';
 
 // Refresh intervals (ms) - shared across all variants
 export const REFRESH_INTERVALS = {
-  feeds: 20 * 60 * 1000,
+  feeds: 10 * 60 * 1000,
   markets: 12 * 60 * 1000,
   crypto: 12 * 60 * 1000,
   predictions: 15 * 60 * 1000,
   forecasts: 30 * 60 * 1000,
   ais: 15 * 60 * 1000,
   pizzint: 10 * 60 * 1000,
-  natural: 60 * 60 * 1000,
+  natural: 10 * 60 * 1000, // USGS refreshes every 5 min upstream; an hourly poll hid new quakes for up to 2 h
   weather: 10 * 60 * 1000,
+  canadaRoads: 10 * 60 * 1000,
+  canadaAlerts: 10 * 60 * 1000,
   fred: 6 * 60 * 60 * 1000,
   oil: 6 * 60 * 60 * 1000,
   spending: 6 * 60 * 60 * 1000,
@@ -47,10 +49,15 @@ export const REFRESH_INTERVALS = {
   temporalBaseline: 10 * 60 * 1000,
   tradePolicy: 60 * 60 * 1000,
   supplyChain: 60 * 60 * 1000,
+  chinaCorridors: 15 * 60 * 1000,
+  chinaActivityNowcast: 15 * 60 * 1000,
   telegramIntel: 60 * 1000,
+  xIntel: 15 * 60 * 1000,
   gulfEconomies: 10 * 60 * 1000,
   groceryBasket: 6 * 60 * 60 * 1000,
   fuelPrices: 6 * 60 * 60 * 1000,
+  fx: 6 * 60 * 60 * 1000, // all three FX keys are daily seeds; 6h picks up the new bar without polling a static payload
+
   faoFoodPriceIndex: 24 * 60 * 60 * 1000, // monthly data; refresh daily is sufficient
   oilInventories: 5 * 60 * 1000, // EIA weekly + EU gas daily; 5min refresh
   climateNews: 30 * 60 * 1000, // seeded every 30min; match cadence
@@ -67,16 +74,20 @@ export const REFRESH_INTERVALS = {
   fuelShortages: 60 * 60 * 1000, // active shortage alerts can change intra-day
   energyDisruptions: 60 * 60 * 1000, // disruption log is low-volume but needs intra-day freshness
   energyRiskOverview: 15 * 60 * 1000, // mixed market + supply-chain overview; refresh more often than the underlying weekly registries
-  chokepointStrip: 90 * 60 * 1000, // matches chokepoint client cache TTL / freshness budget
+  chokepointStrip: 10 * 60 * 1000, // the status refreshes every 6 min; the 5-min client cache never answers a poll
   macroTiles: 30 * 60 * 1000,
   fsi: 30 * 60 * 1000,
   yieldCurve: 30 * 60 * 1000,
   earningsCalendar: 60 * 60 * 1000,
+  materialEvents: 15 * 60 * 1000,
   economicCalendar: 60 * 60 * 1000,
   cotPositioning: 60 * 60 * 1000,
   goldIntelligence: 5 * 60 * 1000,
+  nqPulse: 5 * 60 * 1000,
+  nqCatalysts: 5 * 60 * 1000,
   aaiiSentiment: 60 * 60 * 1000, // weekly data; hourly refresh is sufficient
   marketBreadth: 60 * 60 * 1000, // seeded daily; hourly refresh is sufficient
+  newsMarketCorrelation: 15 * 60 * 1000, // matches the timestamped market-series seed cadence
 };
 
 // Monitor colors - shared
@@ -95,10 +106,14 @@ export const MONITOR_COLORS = [
 
 // Storage keys - shared
 export const STORAGE_KEYS = {
+  variant: 'worldmonitor-variant',
   panels: 'worldmonitor-panels',
   monitors: 'worldmonitor-monitors',
   mapLayers: 'worldmonitor-layers',
   disabledFeeds: 'worldmonitor-disabled-feeds',
+  sourceGateOwnership: 'worldmonitor-free-tier-source-ownership',
+  mapLayerGateOwnership: 'worldmonitor-free-tier-layer-ownership',
+  panelLayoutVariant: 'worldmonitor-panel-layout-variant',
   // Schema version for the disabledFeeds set. Bumped on each migration that
   // mutates the set in a backwards-incompatible way. Currently:
   //   missing/0 → pre-2026-05-01 alphabetical-cap state. Eligible for

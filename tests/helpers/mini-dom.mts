@@ -121,6 +121,13 @@ export class MiniNode extends EventTarget {
     return this.childNodes.filter((child) => child instanceof MiniElement).length;
   }
 
+  contains(other: MiniNode | null): boolean {
+    for (let node: MiniNode | null = other; node; node = node.parentNode) {
+      if (node === this) return true;
+    }
+    return false;
+  }
+
   get textContent(): string {
     return this.childNodes.map((child) => child.textContent ?? '').join('');
   }
@@ -170,12 +177,40 @@ interface MiniAttributeSelector {
   value: string | null;
 }
 
+type MiniStyleDeclaration = Record<string, string> & {
+  getPropertyValue(name: string): string;
+  removeProperty(name: string): string;
+  setProperty(name: string, value: string): void;
+};
+
+function createMiniStyleDeclaration(): MiniStyleDeclaration {
+  const style = {} as MiniStyleDeclaration;
+  Object.defineProperties(style, {
+    getPropertyValue: {
+      value: (name: string) => style[name] ?? '',
+    },
+    removeProperty: {
+      value: (name: string) => {
+        const previous = style[name] ?? '';
+        delete style[name];
+        return previous;
+      },
+    },
+    setProperty: {
+      value: (name: string, value: string) => {
+        style[name] = String(value);
+      },
+    },
+  });
+  return style;
+}
+
 export class MiniElement extends MiniNode {
   readonly nodeType = MiniNode.ELEMENT_NODE;
   readonly attributes = new Map<string, string>();
   readonly classList = new MiniClassList();
   readonly dataset: Record<string, string> = {};
-  readonly style: Record<string, string> = {};
+  readonly style = createMiniStyleDeclaration();
   ownerDocument?: MiniDocument;
   private innerHtml = '';
   id = '';
@@ -273,6 +308,13 @@ export class MiniElement extends MiniNode {
     return null;
   }
 
+  replaceWith(node: MiniElement): void {
+    const parent = this.parentNode;
+    if (!parent || node === this) return;
+    parent.insertBefore(node, this);
+    parent.removeChild(this);
+  }
+
   remove(): void {
     if (this.parentNode) {
       this.parentNode.removeChild(this);
@@ -286,6 +328,17 @@ export class MiniElement extends MiniNode {
   focus(): void {
     const doc = this.ownerDocument ?? globalThis.document as unknown as MiniDocument | undefined;
     if (doc) doc.activeElement = this;
+  }
+
+  click(): void {
+    const event = new Event('click', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'target', { configurable: true, value: this });
+    let node: MiniNode | null = this;
+    while (node) {
+      EventTarget.prototype.dispatchEvent.call(node, event);
+      Object.defineProperty(event, 'target', { configurable: true, value: this });
+      node = node.parentNode;
+    }
   }
 
   get nextElementSibling(): MiniElement | null {
@@ -360,6 +413,10 @@ export class MiniDocument extends EventTarget {
     const element = new MiniElement(tagName);
     element.ownerDocument = this;
     return element;
+  }
+
+  createElementNS(_namespace: string | null, qualifiedName: string): MiniElement {
+    return this.createElement(qualifiedName);
   }
 
   createTextNode(value: string): MiniText {

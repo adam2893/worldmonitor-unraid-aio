@@ -1,3 +1,8 @@
+// This inspects the MapComponent AST to pin zoom-threshold rebuild scheduling,
+// render-time opt-outs and guards on zoom-hidden marker allocation (#8690,
+// section 2). The zoom path needs real element geometry that happy-dom does
+// not compute, so these checks inspect the source contract.
+//
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -81,9 +86,19 @@ describe('SVG map zoom-hidden layer DOM allocation', () => {
 
     assert.match(applyBody, /rebuildOnZoomVisibilityChange = true/);
     assert.match(applyBody, /const zoomVisibilityChanged = this\.updateZoomLayerVisibility\(\)/);
+    // The zoom-visibility rebuild keeps its own branch. #7112's overlay budget
+    // replan is deliberately the ELSE arm: a pass that already rebuilds must not
+    // schedule a second one, and the replan must go through the settle-debounced
+    // scheduleOverlayBudgetReplan() rather than reaching scheduleRender() from
+    // the pan/touchmove/wheel path directly.
     assert.match(
       applyBody,
-      /if \(rebuildOnZoomVisibilityChange && zoomVisibilityChanged\) this\.scheduleRender\(\)/,
+      /if \(rebuildOnZoomVisibilityChange && zoomVisibilityChanged\) \{\s*this\.scheduleRender\(\);\s*\} else if \(overlayBudgetViewportChanged\) \{\s*this\.scheduleOverlayBudgetReplan\(\);\s*\}/,
+    );
+    assert.equal(
+      (applyBody.match(/this\.scheduleRender\(\)/g) ?? []).length,
+      1,
+      'applyTransform must reach scheduleRender() exactly once, on the zoom-visibility branch only',
     );
     assert.ok(mapSrc.includes("SVG_MARKER_DOM_ZOOM_LAYERS = new Set<keyof MapLayers>(['bases', 'nuclear'])"));
     assert.match(updateBody, /let visibilityChanged = false/);

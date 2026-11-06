@@ -11,9 +11,15 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  BILLING_BANNER_DISMISS_KEYS,
   deriveBillingUxState,
   getBillingBannerVariant,
+  getBillingEmailErrorKey,
   getBillingGateOverride,
+  suggestBillingEmail,
+  getReactivationHref,
+  getSubscriptionStatusTone,
+  isSubscriptionCoveringAt,
   type BillingSubscriptionSnapshot,
   type BillingEntitlementSnapshot,
 } from '@/services/billing-state';
@@ -66,14 +72,42 @@ describe('deriveBillingUxState', () => {
     assert.equal(deriveBillingUxState(sub(), null, NOW), 'active');
   });
 
-  it('on_hold wins even while the retry-window entitlement is still valid', () => {
+  it('paid-through on_hold surfaces while the retry-window entitlement is still valid', () => {
     assert.equal(deriveBillingUxState(sub({ status: 'on_hold' }), ent(), NOW), 'on_hold');
   });
 
-  it('on_hold with expired entitlement stays on_hold (not free, not pending)', () => {
+  it('paid-through on_hold surfaces with a missing or expired entitlement snapshot', () => {
+    assert.equal(deriveBillingUxState(sub({ status: 'on_hold' }), null, NOW), 'on_hold');
     assert.equal(
       deriveBillingUxState(sub({ status: 'on_hold' }), ent({ validUntil: NOW - 1 }), NOW),
       'on_hold',
+    );
+  });
+
+  it('on_hold at the exact paid-through boundary remains on_hold', () => {
+    assert.equal(
+      deriveBillingUxState(sub({ status: 'on_hold', currentPeriodEnd: NOW }), null, NOW),
+      'on_hold',
+    );
+  });
+
+  it('expired on_hold is lapsed without separate paid coverage', () => {
+    const expiredHold = sub({ status: 'on_hold', currentPeriodEnd: NOW - 1 });
+    assert.equal(deriveBillingUxState(expiredHold, null, NOW), 'lapsed');
+    assert.equal(
+      deriveBillingUxState(expiredHold, ent({ validUntil: NOW - 1 }), NOW),
+      'lapsed',
+    );
+  });
+
+  it('expired on_hold is active when a separate paid entitlement still covers', () => {
+    assert.equal(
+      deriveBillingUxState(
+        sub({ status: 'on_hold', currentPeriodEnd: NOW - 1 }),
+        ent({ validUntil: NOW + DAY }),
+        NOW,
+      ),
+      'active',
     );
   });
 
@@ -210,8 +244,9 @@ describe('getBillingBannerVariant', () => {
     // en.json's onHoldBannerMessage value is locked byte-identical to the
     // pre-#4771 hardcoded copy in tests/billing-state-wiring.test.mts.
     assert.equal(v.messageKey, 'components.billingState.onHoldBannerMessage');
-    assert.equal(v.actionLabelKey, 'components.billingState.updatePayment');
-    assert.equal(v.action, 'billing-portal');
+    assert.deepEqual(v.actions, [
+      { labelKey: 'components.billingState.updatePayment', kind: 'billing-portal' },
+    ]);
     // Pre-#4771 sessionStorage key must survive so existing dismissals keep working.
     assert.equal(v.dismissKey, 'pf-banner-dismissed');
   });
@@ -221,7 +256,7 @@ describe('getBillingBannerVariant', () => {
     assert.ok(v);
     assert.equal(v.tone, 'warning');
     assert.equal(v.messageKey, 'components.billingState.renewalPendingDesc');
-    assert.equal(v.actionLabelKey, null);
+    assert.deepEqual(v.actions, []);
     assert.equal(v.dismissKey, 'pf-banner-dismissed-renewal-pending');
   });
 
@@ -230,15 +265,65 @@ describe('getBillingBannerVariant', () => {
     assert.ok(v);
     assert.equal(v.tone, 'error');
     assert.equal(v.messageKey, 'components.billingState.renewalFailedDesc');
-    assert.equal(v.actionLabelKey, 'components.billingState.manageBilling');
-    assert.equal(v.action, 'billing-portal');
+    assert.deepEqual(v.actions, [
+      { labelKey: 'components.billingState.manageBilling', kind: 'billing-portal' },
+    ]);
     assert.equal(v.dismissKey, 'pf-banner-dismissed-renewal-failed');
   });
 
-  it('every banner state uses a distinct dismiss key (dismissing one must not suppress another)', () => {
-    const keys = (['on_hold', 'renewal_verification_pending', 'renewal_verification_failed'] as const)
-      .map((s) => getBillingBannerVariant(s)?.dismissKey);
+  it('a bounced billing email on a plain active subscriber is its own amber banner', () => {
+    const v = getBillingBannerVariant('active', true);
+    assert.ok(v);
+    assert.equal(v.tone, 'warning');
+    assert.equal(v.messageKey, 'components.billingState.billingEmailBouncedMessage');
+    assert.deepEqual(v.actions, [
+      { labelKey: 'components.billingState.fixBillingEmail', kind: 'fix-billing-email' },
+    ]);
+    assert.equal(v.dismissKey, 'pf-banner-dismissed-billing-email-bounced');
+  });
+
+  it('on_hold plus a bounce keeps the red banner and adds the fix-email action', () => {
+    const plain = getBillingBannerVariant('on_hold');
+    const v = getBillingBannerVariant('on_hold', true);
+    assert.ok(plain && v);
+    assert.equal(v.tone, 'error');
+    assert.equal(v.messageKey, plain.messageKey);
+    assert.deepEqual(v.actions.map((a) => a.kind), ['billing-portal', 'fix-billing-email']);
+    assert.notEqual(v.dismissKey, plain.dismissKey, 'a bounce must re-surface a dismissed on_hold banner');
+  });
+
+  it('a bounce never surfaces a banner for free or lapsed users', () => {
+    assert.equal(getBillingBannerVariant('free', true), null);
+    assert.equal(getBillingBannerVariant('lapsed', true), null);
+  });
+
+  it('every rendered banner uses a distinct dismiss key, and all are clearable', () => {
+    const states = ['on_hold', 'renewal_verification_pending', 'renewal_verification_failed', 'active'] as const;
+    const keys = states
+      .flatMap((s) => [getBillingBannerVariant(s)?.dismissKey, getBillingBannerVariant(s, true)?.dismissKey])
+      .filter((key): key is string => typeof key === 'string');
     assert.equal(new Set(keys).size, keys.length);
+    for (const key of keys) {
+      assert.ok(BILLING_BANNER_DISMISS_KEYS.includes(key), `${key} must be cleared on recovery`);
+    }
+  });
+});
+
+describe('getBillingEmailErrorKey', () => {
+  it('maps the structured kinds the action throws and falls back for everything else', () => {
+    assert.equal(getBillingEmailErrorKey('INVALID_EMAIL'), 'components.billingState.billingEmailInvalid');
+    assert.equal(getBillingEmailErrorKey('EMAIL_SUPPRESSED'), 'components.billingState.billingEmailSuppressed');
+    assert.equal(getBillingEmailErrorKey('DODO_CUSTOMER_UPDATE_ERROR'), 'components.billingState.billingEmailUpdateFailed');
+    assert.equal(getBillingEmailErrorKey(null), 'components.billingState.billingEmailUpdateFailed');
+    assert.equal(getBillingEmailErrorKey('constructor'), 'components.billingState.billingEmailUpdateFailed');
+  });
+});
+
+describe('suggestBillingEmail', () => {
+  it('offers the signed-in address only when it is a different mailbox', () => {
+    assert.equal(suggestBillingEmail('elie.habbi@gmail.com', 'elie.habib@gmail.com'), 'elie.habib@gmail.com');
+    assert.equal(suggestBillingEmail('elie.habbi@gmail.com', ' Elie.Habbi@gmail.com '), '');
+    assert.equal(suggestBillingEmail('elie.habbi@gmail.com', ''), '');
   });
 });
 
@@ -275,5 +360,123 @@ describe('getBillingGateOverride', () => {
         `${state} produced unexpected override ${String(override)}`,
       );
     }
+  });
+});
+
+describe('getReactivationHref', () => {
+  it('preserves the returning subscriber plan preference', () => {
+    assert.equal(getReactivationHref('pro_annual'), '/pro?wm_reactivate_plan=pro_annual#pricing');
+    assert.equal(getReactivationHref('pro_monthly'), '/pro?wm_reactivate_plan=pro_monthly#pricing');
+    assert.equal(getReactivationHref(null), '/pro#pricing');
+  });
+});
+
+describe('isSubscriptionCoveringAt (#7315)', () => {
+  it('is the single predicate behind both the UX state and the status tone', () => {
+    // deriveBillingUxState and getSubscriptionStatusTone must not drift: the
+    // same cancelled row that keeps coverage here cannot be `lapsed` there.
+    const paidThrough = sub({ status: 'cancelled' });
+    assert.equal(isSubscriptionCoveringAt(paidThrough, NOW), true);
+    assert.equal(deriveBillingUxState(paidThrough, null, NOW), 'active');
+    assert.equal(getSubscriptionStatusTone(paidThrough, NOW), 'ending');
+
+    const lapsedRow = sub({ status: 'cancelled', currentPeriodEnd: NOW - DAY });
+    assert.equal(isSubscriptionCoveringAt(lapsedRow, NOW), false);
+    assert.equal(deriveBillingUxState(lapsedRow, null, NOW), 'lapsed');
+    assert.equal(getSubscriptionStatusTone(lapsedRow, NOW), 'ended');
+  });
+
+  it('active stays unbounded while on_hold is bounded by its inclusive paid-through end', () => {
+    assert.equal(isSubscriptionCoveringAt(sub({ currentPeriodEnd: NOW - DAY }), NOW), true);
+    assert.equal(
+      isSubscriptionCoveringAt(sub({ status: 'on_hold', currentPeriodEnd: NOW + 1 }), NOW),
+      true,
+    );
+    assert.equal(
+      isSubscriptionCoveringAt(sub({ status: 'on_hold', currentPeriodEnd: NOW }), NOW),
+      true,
+    );
+    assert.equal(
+      isSubscriptionCoveringAt(sub({ status: 'on_hold', currentPeriodEnd: NOW - 1 }), NOW),
+      false,
+    );
+  });
+
+  it('expired never covers, even with a future period end', () => {
+    assert.equal(
+      isSubscriptionCoveringAt(sub({ status: 'expired', currentPeriodEnd: NOW + DAY }), NOW),
+      false,
+    );
+  });
+
+  it('an unrecognised runtime status does not cover (fail closed)', () => {
+    const bogus = sub({ status: 'paused' as unknown as 'active' });
+    assert.equal(isSubscriptionCoveringAt(bogus, NOW), false);
+  });
+});
+
+describe('getSubscriptionStatusTone (#7315)', () => {
+  it('a renewing subscription is the active tone', () => {
+    assert.equal(getSubscriptionStatusTone(sub(), NOW), 'active');
+  });
+
+  it('on_hold is the attention tone, even inside the paid period', () => {
+    assert.equal(getSubscriptionStatusTone(sub({ status: 'on_hold' }), NOW), 'attention');
+  });
+
+  it('cancelled-but-paid-through is `ending`, NOT the tone expired gets (#7315)', () => {
+    // The bug this test locks: the panel painted both in the same red, so a
+    // subscriber with a month of Pro left read their plan as already dead.
+    const tone = getSubscriptionStatusTone(sub({ status: 'cancelled' }), NOW);
+    assert.equal(tone, 'ending');
+    assert.notEqual(tone, getSubscriptionStatusTone(sub({ status: 'expired' }), NOW));
+  });
+
+  it('cancelled past the paid period is the ended tone', () => {
+    assert.equal(
+      getSubscriptionStatusTone(sub({ status: 'cancelled', currentPeriodEnd: NOW - DAY }), NOW),
+      'ended',
+    );
+  });
+
+  it('expired is the ended tone even with a future period end (mirrors isCoveringAt)', () => {
+    assert.equal(
+      getSubscriptionStatusTone(sub({ status: 'expired', currentPeriodEnd: NOW + DAY }), NOW),
+      'ended',
+    );
+  });
+
+  it('active with a cancellation scheduled at period end is `ending`, not `active`', () => {
+    // Dodo keeps a portal-cancelled subscription `active` until the period
+    // ends. Painting it as a renewing plan told users their cancel failed.
+    assert.equal(
+      getSubscriptionStatusTone(sub({ status: 'active', cancelAtPeriodEnd: true }), NOW),
+      'ending',
+    );
+    assert.equal(
+      getSubscriptionStatusTone(sub({ status: 'active', cancelAtPeriodEnd: false }), NOW),
+      'active',
+    );
+  });
+
+  it('a scheduled cancellation still has working access', () => {
+    assert.equal(
+      deriveBillingUxState(sub({ status: 'active', cancelAtPeriodEnd: true }), ent(), NOW),
+      'active',
+    );
+  });
+
+  it('boundary: cancelled with currentPeriodEnd exactly now is still covering', () => {
+    assert.equal(
+      getSubscriptionStatusTone(sub({ status: 'cancelled', currentPeriodEnd: NOW }), NOW),
+      'ending',
+    );
+  });
+
+  it('an unrecognised runtime status is an explicit `unknown`, never silently ended', () => {
+    // A new provider status must not be asserted as a dead plan to a user the
+    // entitlement engine still considers entitled.
+    const bogus = sub({ status: 'paused' as unknown as 'active' });
+    assert.equal(getSubscriptionStatusTone(bogus, NOW), 'unknown');
   });
 });

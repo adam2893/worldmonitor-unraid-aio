@@ -99,7 +99,7 @@ jobs:
   release:
     name: Publish protected beta release
     needs: build-test-scan
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'imzenreally/worldmonitor-unraid-aio'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && (github.repository == 'imzenreally/worldmonitor-unraid-aio' || github.repository == 'adam2893/worldmonitor-unraid-aio')
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     permissions:

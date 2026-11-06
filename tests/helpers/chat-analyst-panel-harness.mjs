@@ -1,9 +1,10 @@
 import { build } from 'esbuild';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createBrowserEnvironment } from './runtime-config-panel-harness.mjs';
+import { createTempDir, removeTempDir } from './temp-dir.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..', '..');
@@ -37,7 +38,7 @@ function defineGlobal(name, value) {
 }
 
 async function loadChatAnalystPanel() {
-  const tempDir = mkdtempSync(join(tmpdir(), 'wm-chat-analyst-panel-'));
+  const tempDir = createTempDir('wm-chat-analyst-panel-');
   const outfile = join(tempDir, 'ChatAnalystPanel.bundle.mjs');
 
   const stubModules = new Map([
@@ -52,9 +53,10 @@ async function loadChatAnalystPanel() {
     `],
     ['tauri-bridge-stub', `
       export function invokeTauri() { return Promise.reject(new Error('not wired in test')); }
+      export function hasTauriInvokeBridge() { return false; }
     `],
     ['analytics-stub', `
-      export function trackPanelResized() {}
+      export function trackLayoutCustomized() {}
       export function trackAnalystControlAction(actionType, status, reason) {
         globalThis.__wmAnalystControlTelemetry?.push({
           actionType,
@@ -75,12 +77,24 @@ async function loadChatAnalystPanel() {
         ANONYMOUS: 'anonymous',
         FREE_TIER: 'free_tier',
       });
+      // No entitlement snapshot and no role claim — the panel's denial
+      // classifier then treats a 403 as an honest upsell. Tests that care
+      // about the desync branch drive classifyPremiumDenial directly
+      // (tests/premium-denial.test.mts); @/services/premium-denial is a pure
+      // leaf and is bundled for real here rather than stubbed.
+      export function readClientEntitlementBelief() {
+        return { entitlementTier: null, authRole: null };
+      }
+    `],
+    ['auth-state-stub', `
+      export function getAuthState() { return { user: null }; }
     `],
     ['premium-fetch-stub', `
       export function premiumFetch() { return Promise.reject(new Error('not wired in test')); }
     `],
     ['analyst-markdown-stub', `
       export function postProcessAnalystHtml(html) { return html; }
+      export function balanceStreamingMarkdown(text) { return text; }
     `],
     ['marked-stub', `
       export const marked = { parse: (s) => s };
@@ -107,6 +121,7 @@ async function loadChatAnalystPanel() {
     ['@/services/ai-flow-settings', 'ai-flow-settings-stub'],
     ['@/services/runtime-config', 'runtime-config-stub'],
     ['@/services/panel-gating', 'panel-gating-stub'],
+    ['@/services/auth-state', 'auth-state-stub'],
     ['@/services/premium-fetch', 'premium-fetch-stub'],
     ['@/utils/analyst-markdown', 'analyst-markdown-stub'],
     ['@/services/checkout', 'checkout-stub'],
@@ -146,7 +161,7 @@ async function loadChatAnalystPanel() {
   return {
     ChatAnalystPanel: mod.ChatAnalystPanel,
     cleanupBundle() {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     },
   };
 }

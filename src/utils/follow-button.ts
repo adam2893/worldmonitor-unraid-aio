@@ -46,7 +46,9 @@ import {
   FREE_TIER_FOLLOW_LIMIT,
   type FollowMutationResult,
 } from '@/services/followed-countries';
+import { WEB_APP_ORIGIN } from '@/config/web-origin';
 import { onEntitlementChange } from '@/services/entitlements';
+import { openExternalUrl } from '@/services/external-navigation';
 import { escapeHtml } from '@/utils/sanitize';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
 
@@ -86,18 +88,28 @@ export interface FollowButtonHandle {
 // Test-injection seam: upgrade-modal trigger
 // ---------------------------------------------------------------------------
 //
-// In production, the `FREE_CAP` branch dynamically imports clerk +
-// checkout (the same lazy path `notifications-settings.ts` uses for the
-// "Upgrade to Pro" button). Tests inject a synchronous fake here so
+// In production, the `FREE_CAP` branch dynamically imports clerk and
+// opens sign-in or the /pro plan picker (`openUpgradePlans`). Tests inject a synchronous fake here so
 // they can assert the trigger was called without spinning up the real
 // import graph.
 
 type UpgradeTrigger = (source: string) => void;
 
+/**
+ * Fallback upgrade destination: the /pro plan picker. Absolute, and routed
+ * through `openExternalUrl`: the bare relative `/pro#pricing` this replaced
+ * resolved against `tauri://localhost` in the desktop WebView, where no such
+ * route exists (#5911). Never throws.
+ */
+function openProPricingPage(): void {
+  void openExternalUrl(`${WEB_APP_ORIGIN}/pro#pricing`).catch(() => {
+    /* swallow — non-browser env, or the OS opener refused */
+  });
+}
+
 let _upgradeTrigger: UpgradeTrigger = (source) => {
-  // Match the notifications-settings.ts pattern: try sign-in first if no
-  // user, otherwise drop into checkout. If anything fails we fall back
-  // to the `/pro` page (consistent w/ ProBanner CTA).
+  // Match the notifications-settings.ts pattern: sign-in first if there is
+  // no user, otherwise the `/pro` plan picker (consistent w/ ProBanner CTA).
   try {
     void import('@/services/clerk').then((clerk) => {
       const user = clerk.getCurrentClerkUser?.();
@@ -108,28 +120,17 @@ let _upgradeTrigger: UpgradeTrigger = (source) => {
           return;
         }
       }
-      // Signed-in OR no openSignIn helper — go straight to checkout.
-      void import('@/services/checkout')
-        .then((checkout) =>
-          import('@/config/products').then((products) => {
-            const product = (products as { DEFAULT_UPGRADE_PRODUCT?: unknown })
-              .DEFAULT_UPGRADE_PRODUCT;
-            if (product && typeof checkout.startCheckout === 'function') {
-              checkout.startCheckout(
-                product as Parameters<typeof checkout.startCheckout>[0],
-              );
-            } else {
-              window.open('/pro#pricing', '_blank', 'noopener,noreferrer');
-            }
-          }),
-        )
-        .catch(() => {
-          window.open('/pro#pricing', '_blank', 'noopener,noreferrer');
-        });
+      // Signed-in OR no openSignIn helper: the plan picker on /pro, through
+      // the shared helper so a desktop purchase keeps its handoff marker.
+      void import('@/services/upgrade-flow')
+        .then((flow) => flow.openUpgradePlans())
+        .catch(() => openProPricingPage());
+    }).catch(() => {
+      openProPricingPage();
     });
   } catch {
     try {
-      window.open('/pro#pricing', '_blank', 'noopener,noreferrer');
+      openProPricingPage();
     } catch {
       /* swallow — non-browser env */
     }
@@ -148,7 +149,7 @@ export function _setUpgradeTriggerForTests(fn: UpgradeTrigger | null): void {
   _upgradeTrigger = fn ?? ((source) => {
     void source;
     try {
-      window.open('/pro#pricing', '_blank', 'noopener,noreferrer');
+      openProPricingPage();
     } catch {
       /* swallow */
     }
@@ -412,6 +413,11 @@ async function onClick(
 
   switch (result.reason) {
     case 'FREE_CAP':
+      // Country Watcher's honest conversion trigger (plan U6/R12): the cap
+      // hit is the upgrade moment, so it joins the funnel as a gate-hit.
+      void import('@/services/analytics')
+        .then((analytics) => analytics.trackGateHit('limits.followed_countries'))
+        .catch(() => {});
       try {
         _upgradeTrigger('follow-cap');
       } catch (err) {

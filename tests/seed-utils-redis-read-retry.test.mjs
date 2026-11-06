@@ -194,6 +194,20 @@ test('writeFreshnessMetadata: still throws after exhausting retries', async () =
   assert.equal(calls, 3, 'default retry count should be 2 (3 total attempts)');
 });
 
+test('writeFreshnessMetadata: HTTP-200 command errors retry and then throw', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return buildResponse({ body: { error: 'ERR injected metadata rejection' } });
+  };
+
+  await assert.rejects(
+    () => writeFreshnessMetadata('military', 'flights', 12, 'opensky', 600),
+    /Redis SET rejected by Upstash: ERR injected metadata rejection/,
+  );
+  assert.equal(calls, 3, 'command-level failures must not be mistaken for a successful seed-meta write');
+});
+
 // ---------- readCanonicalEnvelopeMeta (the skip-path mirror GET) ----------
 // A transient failure here is worse than a crash: the caller falls back to
 // writing recordCount=0 with fetchedAt=NOW, resetting the freshness clock and
@@ -223,4 +237,14 @@ test('readCanonicalEnvelopeMeta: retries on timeout, still null (never throws) w
   const meta = await readCanonicalEnvelopeMeta('intelligence:gdelt-intel:v1');
   assert.equal(calls, 3, 'default retry count should be 2 (3 total attempts)');
   assert.equal(meta, null, 'defensive null contract preserved');
+});
+
+test('verifySeedKey: a cooldown beyond the bounded wait fails without an early retry', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return buildResponse({ ok: false, status: 429, body: {}, headers: { 'Retry-After': '120' } });
+  };
+  assert.equal(await verifySeedKey('fixture:cooldown'), null);
+  assert.equal(calls, 1);
 });

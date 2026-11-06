@@ -1,3 +1,7 @@
+// These seven checks pin the static import graph and emitted build chunks.
+// Runtime tests cannot prove which code ships or preloads; behavior is covered
+// by map-viewport-runtime and the DeckGL/Globe DOM runtime suites (#8690).
+
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
@@ -153,40 +157,6 @@ function dynamicImportSpecifiers(sourceFile) {
   return specifiers;
 }
 
-function mapContainerClass(sourceFile) {
-  const cls = sourceFile.statements.find((statement) => (
-    ts.isClassDeclaration(statement) && statement.name?.text === 'MapContainer'
-  ));
-  assert.ok(cls, 'MapContainer class should exist');
-  return cls;
-}
-
-function findClass(sourceFile, className) {
-  const cls = sourceFile.statements.find((statement) => (
-    ts.isClassDeclaration(statement) && statement.name?.text === className
-  ));
-  assert.ok(cls, `${className} class should exist`);
-  return cls;
-}
-
-function classMemberNames(cls) {
-  return new Set(cls.members
-    .filter((member) => ts.isPropertyDeclaration(member) || ts.isMethodDeclaration(member))
-    .map((member) => member.name)
-    .filter(ts.isIdentifier)
-    .map((name) => name.text));
-}
-
-function methodBodyText(cls, methodName) {
-  const method = cls.members.find((member) => (
-    ts.isMethodDeclaration(member)
-    && ts.isIdentifier(member.name)
-    && member.name.text === methodName
-  ));
-  assert.ok(method?.body, `MapContainer.${methodName} should have a method body`);
-  return method.body.getText();
-}
-
 describe('map renderer deferral boundary', () => {
   it('keeps MapContainer free of top-level renderer/runtime value imports', () => {
     const mapContainer = parseSource('src/components/MapContainer.ts');
@@ -332,139 +302,4 @@ describe('map renderer deferral boundary', () => {
     }
   });
 
-  it('caches renderer data calls that can arrive before the deferred renderer exists', () => {
-    const mapContainer = parseSource('src/components/MapContainer.ts');
-    const cls = mapContainerClass(mapContainer);
-    const members = classMemberNames(cls);
-
-    for (const field of ['cachedTrafficAnomalies', 'cachedDdosLocations', 'cachedChokepointData']) {
-      assert.ok(members.has(field), `MapContainer should cache ${field} for deferred renderer replay`);
-    }
-
-    const rehydrateBody = methodBodyText(cls, 'rehydrateActiveMap');
-    const setterExpectations = [
-      ['setTrafficAnomalies', 'cachedTrafficAnomalies'],
-      ['setDdosLocations', 'cachedDdosLocations'],
-      ['setChokepointData', 'cachedChokepointData'],
-    ];
-
-    for (const [setter, cacheField] of setterExpectations) {
-      const setterBody = methodBodyText(cls, setter);
-      assert.match(
-        setterBody,
-        new RegExp(`this\\.${cacheField}\\s*=`),
-        `${setter} should update ${cacheField}`,
-      );
-      assert.match(
-        rehydrateBody,
-        new RegExp(`this\\.${setter}\\(this\\.${cacheField}\\)`),
-        `rehydrateActiveMap should replay ${setter}`,
-      );
-    }
-  });
-
-  it('queues chokepoint popup opens that arrive before the deferred renderer exists', () => {
-    const mapContainer = parseSource('src/components/MapContainer.ts');
-    const cls = mapContainerClass(mapContainer);
-    const members = classMemberNames(cls);
-
-    assert.ok(
-      members.has('pendingChokepointOpen'),
-      'MapContainer should cache chokepoint deep-link opens for deferred renderer replay',
-    );
-    assert.ok(
-      members.has('rendererReady'),
-      'MapContainer should track concrete renderer readiness before replaying chokepoint opens',
-    );
-    assert.ok(
-      members.has('replayPendingChokepointOpen'),
-      'MapContainer should replay queued chokepoint opens from explicit renderer-ready points',
-    );
-
-    const openBody = methodBodyText(cls, 'openChokepoint');
-    assert.match(
-      openBody,
-      /!this\.isChokepointRendererReady\(\)[\s\S]*this\.pendingChokepointOpen\s*=\s*id[\s\S]*return/,
-      'openChokepoint should queue the id until the concrete renderer is ready',
-    );
-
-    const replayBody = methodBodyText(cls, 'replayPendingChokepointOpen');
-    assert.match(
-      replayBody,
-      /this\.pendingChokepointOpen[\s\S]*this\.openChokepoint\(pendingChokepointOpen\)/,
-      'replayPendingChokepointOpen should drain the queued chokepoint through the public open path',
-    );
-
-    const rehydrateBody = methodBodyText(cls, 'rehydrateActiveMap');
-    assert.doesNotMatch(
-      rehydrateBody,
-      /pendingChokepointOpen/,
-      'rehydrateActiveMap must not consume chokepoint opens before async renderer readiness/fallback settles',
-    );
-
-    const svgBody = methodBodyText(cls, 'initSvgMap');
-    assert.match(
-      svgBody,
-      /this\.rendererReady\s*=\s*true[\s\S]*this\.replayPendingChokepointOpen\(\)/,
-      'SVG fallback should replay queued chokepoint opens once it is ready',
-    );
-
-    const deckBody = methodBodyText(cls, 'createDeckGLMap');
-    assert.match(
-      deckBody,
-      /await\s+this\.deckGLMap\.whenReady\(\)[\s\S]*this\.rendererReady\s*=\s*true[\s\S]*this\.replayPendingChokepointOpen\(\)/,
-      'DeckGL should replay queued chokepoint opens only after whenReady() succeeds',
-    );
-  });
-
-  // The MapContainer queue only covers "no renderer object yet". A deferred
-  // renderer object can exist while its underlying map (DeckGL maplibreMap /
-  // GlobeMap globe) is still being built asynchronously — rehydrateActiveMap
-  // replays the queued open *before* createDeckGLMap awaits whenReady(). Each
-  // renderer's setCenter no-ops until its map exists, so openChokepoint must
-  // defer the pan+popup until it is ready rather than dropping it silently.
-  it('defers chokepoint opens in the async WebGL/globe renderers until their map is built', () => {
-    const deckBody = methodBodyText(findClass(parseSource('src/components/DeckGLMap.ts'), 'DeckGLMap'), 'openChokepoint');
-    assert.match(deckBody, /this\.maplibreMap/, 'DeckGLMap.openChokepoint should gate on maplibreMap readiness');
-    assert.match(deckBody, /whenReady\(\)/, 'DeckGLMap.openChokepoint should defer until whenReady() when maplibreMap is not built yet');
-
-    const globeBody = methodBodyText(findClass(parseSource('src/components/GlobeMap.ts'), 'GlobeMap'), 'openChokepoint');
-    assert.match(globeBody, /this\.globe/, 'GlobeMap.openChokepoint should gate on globe readiness');
-    assert.match(globeBody, /whenReady\(\)/, 'GlobeMap.openChokepoint should defer until whenReady() when the globe is not built yet');
-  });
-
-  it('gates desktop DeckGL startup behind viewport idle or first interaction', () => {
-    const mapContainer = parseSource('src/components/MapContainer.ts');
-    const cls = mapContainerClass(mapContainer);
-    const members = classMemberNames(cls);
-
-    assert.ok(
-      members.has('rendererDemandCleanup'),
-      'MapContainer should keep a cleanup handle for pending renderer demand listeners',
-    );
-
-    const initBody = methodBodyText(cls, 'init');
-    assert.match(
-      initBody,
-      /await\s+this\.waitForDeckRendererDemand\(token\)[\s\S]*await\s+this\.createDeckGLMap\(token\)/,
-      'DeckGL renderer creation should wait for the demand gate before importing maplibre/deck',
-    );
-
-    const demandBody = methodBodyText(cls, 'waitForDeckRendererDemand');
-    assert.match(demandBody, /IntersectionObserver/, 'demand gate should observe map viewport visibility');
-    assert.match(demandBody, /requestIdleCallback/, 'visible maps should wait for browser idle before loading DeckGL');
-    assert.match(demandBody, /pointerdown/, 'first map pointer interaction should release the demand gate');
-    assert.match(demandBody, /wheel/, 'first map wheel interaction should release the demand gate');
-    assert.match(demandBody, /touchstart/, 'first touch interaction should release the demand gate');
-    assert.match(
-      demandBody,
-      /idleFallbackDelayId[\s\S]*window\.clearTimeout\(idleFallbackDelayId\)/,
-      'requestIdleCallback fallback timers should be canceled when the demand wait is cleaned up',
-    );
-    assert.match(
-      demandBody,
-      /fallbackDelayId\s*=\s*window\.setTimeout\([\s\S]*DECK_RENDERER_MAX_WAIT_MS/,
-      'demand gate must arm a universal backstop timer (not only when IntersectionObserver is absent) so an off-screen / partially-visible / deferred-mounted map always loads instead of hanging on the shell',
-    );
-  });
 });

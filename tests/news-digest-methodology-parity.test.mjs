@@ -5,11 +5,19 @@
 // test locks the small set of public constants/vocabularies that readers and
 // API clients rely on, without trying to parse every sentence in the doc.
 
+import { buildServerIntelSources, buildServerVariantFeeds } from '../shared/news-catalog.ts';
+import { VALID_VARIANTS } from '../server/worldmonitor/news/v1/list-feed-digest.ts';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
+import {
+  OPENROUTER_FREE_BACKUP_MODEL,
+  OPENROUTER_FREE_PRIMARY_MODEL,
+} from '../scripts/_llm-model-timeouts.mjs';
+import { extractDelimitedBlock } from '../scripts/lib/js-source-structure.mjs';
+import { ACCUMULATOR_RETENTION_MS } from '../scripts/_forecast-evidence-archive.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..');
@@ -50,6 +58,14 @@ const digestSrc = readFileSync(
   resolve(repoRoot, 'server/worldmonitor/news/v1/list-feed-digest.ts'),
   'utf8',
 );
+const briefLlmSrc = readFileSync(
+  resolve(repoRoot, 'scripts/lib/brief-llm.mjs'),
+  'utf8',
+);
+const rssCacheSrc = readFileSync(
+  resolve(repoRoot, 'server/worldmonitor/news/v1/_rss-cache.ts'),
+  'utf8',
+);
 const classifierSrc = readFileSync(
   resolve(repoRoot, 'server/worldmonitor/news/v1/_classifier.ts'),
   'utf8',
@@ -62,8 +78,8 @@ const summarizeSrc = readFileSync(
   resolve(repoRoot, 'server/worldmonitor/news/v1/summarize-article.ts'),
   'utf8',
 );
-const feedsSrc = readFileSync(
-  resolve(repoRoot, 'server/worldmonitor/news/v1/_feeds.ts'),
+const summaryCacheKeySrc = readFileSync(
+  resolve(repoRoot, 'src/utils/summary-cache-key.ts'),
   'utf8',
 );
 const cacheKeysSrc = readFileSync(
@@ -80,6 +96,10 @@ const cooldownDecisionSrc = readFileSync(
 );
 const seedDigestSrc = readFileSync(
   resolve(repoRoot, 'scripts/seed-digest-notifications.mjs'),
+  'utf8',
+);
+const digestEmailHtmlSrc = readFileSync(
+  resolve(repoRoot, 'scripts/lib/digest-email-html.mjs'),
   'utf8',
 );
 const latestBriefApiSrc = readFileSync(
@@ -213,19 +233,9 @@ function extractArrayLiteralValues(src, constName) {
 }
 
 function extractFunctionBody(src, functionName) {
-  const re = new RegExp(`function\\s+${functionName}\\s*\\([^)]*\\)\\s*(?::[^\\{]+)?\\{`);
-  const match = src.match(re);
-  assert.ok(match?.index !== undefined, `failed to locate function ${functionName}`);
-
-  let depth = 1;
-  const bodyStart = match.index + match[0].length;
-  for (let i = bodyStart; i < src.length; i++) {
-    const ch = src[i];
-    if (ch === '{') depth++;
-    if (ch === '}') depth--;
-    if (depth === 0) return src.slice(bodyStart, i);
-  }
-  assert.fail(`failed to parse function body for ${functionName}`);
+  const body = extractDelimitedBlock(src, `function ${functionName}`);
+  assert.notEqual(body, null, `failed to locate function ${functionName}`);
+  return body;
 }
 
 function extractInterfaceBody(src, interfaceName) {
@@ -270,10 +280,29 @@ function extractStringUnionValues(src, propertyName) {
   return [...match[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
 }
 
-function extractPromptPairLimit(src) {
-  const match = src.match(/nonEmpty\.slice\(0,\s*([0-9]+)\)/);
-  assert.ok(match, 'failed to locate prompt-pair headline limit');
-  return Number(match[1]);
+function extractPromptPairLimit(src, cacheKeySrc) {
+  // #5969: the prompt window must come from the SAME bounded selection the
+  // cache key uses, or a story can reach the model without reaching cache
+  // identity. A bare substring check is not enough — the call can be present
+  // while its result is discarded and the window re-widened downstream — so
+  // pin the assignment AND assert nothing re-derives the window from the
+  // unbounded `paired` list afterwards.
+  assert.match(
+    src,
+    /const selectedPairs = mode === 'translate' \? paired\.slice\(0, 1\) : selectUniqueHeadlinePairs\(paired\);/,
+    'translation must use its keyed first headline; summaries use their bounded unique window',
+  );
+  assert.match(
+    src,
+    /const sanitizedPairs = selectedPairs\.map\(/,
+    'prompt sanitisation must consume the bounded selectedPairs, not the raw pairs',
+  );
+  assert.doesNotMatch(
+    src,
+    /const sanitizedPairs = paired\.map\(|nonEmpty = paired\b|selectUniqueHeadlinePairs\(paired\)\.concat/,
+    'prompt window must not be re-widened from the unbounded paired list',
+  );
+  return extractNumericConst(cacheKeySrc, 'MAX_SUMMARY_HEADLINES');
 }
 
 function extractEntityCorroborationCap(src) {
@@ -321,7 +350,7 @@ function extractYamlSchemaBlock(yamlText, schemaName) {
   assert.notEqual(start, -1, `failed to locate YAML schema ${schemaName}`);
 
   const end = lines.findIndex((line, index) =>
-    index > start && /^        \S.*:\s*$/.test(line),
+    index > start && /^ {8}\S.*:\s*$/.test(line),
   );
   return lines.slice(start, end === -1 ? undefined : end).join('\n');
 }
@@ -330,67 +359,18 @@ function formatFeedName(name, lang) {
   return lang ? `${name} (${lang})` : name;
 }
 
-function extractFeedInventoryRows(src) {
+// Server digest inventory, in server order, read from the catalog's server view.
+// INTEL_SOURCES follow the full edition as the `intel` category.
+function extractFeedInventoryRows() {
+  const format = (feed) => formatFeedName(feed.name, feed.lang);
   const rows = [];
-  let inVariants = false;
-  let currentVariant = null;
-  let currentCategory = null;
-
-  for (const line of src.split(/\r?\n/)) {
-    if (line.startsWith('export const VARIANT_FEEDS')) {
-      inVariants = true;
-      continue;
-    }
-    if (!inVariants) continue;
-    if (line.startsWith('};')) break;
-
-    const variantMatch = line.match(/^  ([A-Za-z][A-Za-z0-9_]*): \{$/);
-    if (variantMatch) {
-      currentVariant = variantMatch[1];
-      currentCategory = null;
-      continue;
-    }
-    if (currentVariant && line === '  },') {
-      currentVariant = null;
-      currentCategory = null;
-      continue;
-    }
-
-    const categoryMatch = line.match(/^    (?:(['"])(.*?)\1|([A-Za-z][A-Za-z0-9_]*)):\s\[$/);
-    if (currentVariant && categoryMatch) {
-      currentCategory = categoryMatch[2] ?? categoryMatch[3];
-      rows.push({ variant: currentVariant, category: currentCategory, sources: [] });
-      continue;
-    }
-    if (currentCategory && line === '    ],') {
-      currentCategory = null;
-      continue;
-    }
-
-    const feedMatch = line.match(/\{\s*name:\s*(['"])(.*?)\1,/);
-    if (currentVariant && currentCategory && feedMatch) {
-      const lang = line.match(/lang:\s*'([^']+)'/)?.[1];
-      rows.at(-1).sources.push(formatFeedName(feedMatch[2], lang));
+  for (const [variant, byCategory] of Object.entries(buildServerVariantFeeds())) {
+    for (const [category, feeds] of Object.entries(byCategory)) {
+      rows.push({ variant, category, sources: feeds.map(format) });
     }
   }
-
-  const intelSources = [];
-  let inIntelSources = false;
-  for (const line of src.split(/\r?\n/)) {
-    if (line.startsWith('export const INTEL_SOURCES')) {
-      inIntelSources = true;
-      continue;
-    }
-    if (!inIntelSources) continue;
-    if (line.startsWith('];')) break;
-    const feedMatch = line.match(/\{\s*name:\s*(['"])(.*?)\1,/);
-    if (feedMatch) {
-      const lang = line.match(/lang:\s*'([^']+)'/)?.[1];
-      intelSources.push(formatFeedName(feedMatch[2], lang));
-    }
-  }
-
-  assert.ok(rows.length > 0, 'failed to extract VARIANT_FEEDS inventory rows');
+  const intelSources = buildServerIntelSources().map(format);
+  assert.ok(rows.length > 0, 'failed to extract server inventory rows');
   assert.ok(intelSources.length > 0, 'failed to extract INTEL_SOURCES inventory');
   const fullSectionInsertAt = rows.findLastIndex((row) => row.variant === 'full');
   assert.notEqual(fullSectionInsertAt, -1, 'failed to extract full variant rows for INTEL_SOURCES insertion');
@@ -423,7 +403,7 @@ function assertDocMatches(re, label) {
 describe('news digest methodology parity', () => {
   it('keeps SummarizeArticle headline limits aligned across implementation and API docs', () => {
     const rawHeadlineLimit = extractNumericConst(summarizeSrc, 'MAX_HEADLINES');
-    const promptPairLimit = extractPromptPairLimit(summarizeSrc);
+    const promptPairLimit = extractPromptPairLimit(summarizeSrc, summaryCacheKeySrc);
     assert.equal(rawHeadlineLimit, 10);
     assert.equal(promptPairLimit, 5);
 
@@ -460,15 +440,15 @@ describe('news digest methodology parity', () => {
 
   it('documents the server news feed inventory in public data-source docs', () => {
     assert.ok(
-      dataSourcesText.includes('source-backed from `server/worldmonitor/news/v1/_feeds.ts`'),
-      'data sources page must identify _feeds.ts as the server inventory source of truth',
+      dataSourcesText.includes('source-backed from `shared/news-catalog.json`'),
+      'data sources page must identify the news catalog as the server inventory source of truth',
     );
 
-    const rows = extractFeedInventoryRows(feedsSrc);
+    const rows = extractFeedInventoryRows();
     assert.equal(
       rows.length,
-      65,
-      'server news feed inventory row count changed; update _feeds.ts, docs/data-sources.mdx, and this assertion together',
+      73,
+      'server news feed inventory row count changed; update shared/news-catalog.json, docs/data-sources.mdx, and this assertion together',
     );
     for (const row of rows) {
       assert.ok(
@@ -500,7 +480,20 @@ describe('news digest methodology parity', () => {
   it('documents news digest cache TTLs from the implementation', () => {
     const healthyTtl = extractNumericConst(digestSrc, 'CACHE_TTL_HEALTHY_S');
     const emptyTtl = extractNumericConst(digestSrc, 'CACHE_TTL_EMPTY_S');
-    const digestTtl = digestSrc.match(/cachedFetchJson<ListFeedDigestResponse>\(\s*digestCacheKey,\s*([0-9_]+)/s);
+    // Matches either cachedFetchJson wrapper — #7084 switched the digest to
+    // cachedFetchJsonWithMeta to learn whether the fetcher actually ran, and
+    // pinning the exact wrapper name made this guard fail on a rename with the
+    // TTL unchanged (the match went null, so the parsed TTL became NaN).
+    const digestTtl = digestSrc.match(
+      /cachedFetchJson(?:WithMeta)?<ListFeedDigestResponse>\(\s*digestCacheKey,\s*([0-9_]+)/s,
+    );
+    // Fail on the LOOKUP before failing on the value: without this, a match
+    // that goes null parses to NaN and the failure reads as "the TTL changed"
+    // when the truth is "this guard can no longer find the TTL".
+    assert.ok(
+      digestTtl,
+      'could not locate the digest cachedFetchJson call to read its TTL; update this guard alongside the call',
+    );
 
     assert.equal(
       healthyTtl,
@@ -531,8 +524,8 @@ describe('news digest methodology parity', () => {
   });
 
   it('documents the accepted feed digest variants from VALID_VARIANTS', () => {
-    const variants = extractSetLiteralValues(digestSrc, 'VALID_VARIANTS');
-    assert.deepEqual(variants, ['full', 'tech', 'finance', 'happy', 'commodity']);
+    const variants = [...VALID_VARIANTS];
+    assert.deepEqual(variants, ['full', 'tech', 'finance', 'commodity', 'happy', 'energy']);
     for (const variant of variants) assertDocIncludes(`\`${variant}\``, `variant ${variant}`);
     for (const variant of variants) {
       assert.ok(
@@ -540,18 +533,18 @@ describe('news digest methodology parity', () => {
         `list_feed_digest.proto variant comment must mention ${variant}`,
       );
     }
-    assertDocIncludes('`energy` is a site and client-feed variant', 'energy site-variant distinction');
-    assertDocMatches(/variant=energy[\s\S]*to\s+`full`/, 'energy digest fallback');
+    assertDocIncludes('news:digest:v1:energy:{lang}', 'energy digest cache key');
     assert.ok(
-      protoText.includes('including energy') && protoText.includes('fall back to full'),
-      'list_feed_digest.proto variant comment must document energy fallback',
+      protoText.includes('fall back to full'),
+      'list_feed_digest.proto variant comment must document the unsupported-variant fallback',
     );
   });
 
   it('documents the ingest freshness floor default', () => {
     assert.ok(
-      digestSrc.includes('process.env.NEWS_MAX_AGE_HOURS') &&
-        /const\s+hours\s*=.*\?\s*raw\s*:\s*96\s*;/s.test(digestSrc),
+      rssCacheSrc.includes('process.env.NEWS_MAX_AGE_HOURS') &&
+        /const\s+hours\s*=.*\?\s*raw\s*:\s*96\s*;/s.test(rssCacheSrc) &&
+        digestSrc.includes('const maxAgeMs = resolveMaxAgeMs();'),
       'resolveMaxAgeMs must still default NEWS_MAX_AGE_HOURS to 96h',
     );
     assertDocIncludes('NEWS_MAX_AGE_HOURS', 'freshness env var');
@@ -659,6 +652,34 @@ describe('news digest methodology parity', () => {
     }
   });
 
+  it('documents credibilityScore as distinct from importanceScore', () => {
+    const credibilityDoc = readFileSync(
+      resolve(repoRoot, 'docs/methodology/news-credibility.mdx'),
+      'utf8',
+    );
+    assert.ok(credibilityDoc.includes('`0.50`'), 'credibility methodology must document propaganda-risk weight');
+    assert.ok(credibilityDoc.includes('`0.30`'), 'credibility methodology must document source-tier weight');
+    assert.ok(credibilityDoc.includes('`0.20`'), 'credibility methodology must document corroboration weight');
+    assert.ok(credibilityDoc.includes('`40`'), 'credibility methodology must document the high-risk cap');
+    assertDocMatches(/## Credibility Score/, 'digest methodology credibility section');
+    assertDocIncludes('`0.50`', 'credibility propaganda-risk weight on digest methodology');
+    assertDocIncludes('capped at `40`', 'credibility high-risk cap on digest methodology');
+
+    const credibilityDescription = openApiDescription('NewsItem', 'credibilityScore');
+    assert.ok(
+      credibilityDescription.includes('distinct from importance_score'),
+      'NewsItem.credibilityScore OpenAPI must stay distinct from importanceScore',
+    );
+    assert.ok(
+      credibilityDescription.includes('capped at 40'),
+      'NewsItem.credibilityScore OpenAPI must document the state-media cap',
+    );
+    assert.ok(
+      newsItemProtoText.includes('int32 credibility_score = 14;'),
+      'NewsItem proto must keep credibility_score distinct from importance_score = 9',
+    );
+  });
+
   it('documents diplomacy severity promotion scope', () => {
     const promotionBody = extractFunctionBody(digestSrc, 'promoteDiplomacySeverity');
     assert.ok(
@@ -705,8 +726,10 @@ describe('news digest methodology parity', () => {
     const itemsPerFeed = extractNumericConst(digestSrc, 'ITEMS_PER_FEED');
     const maxItemsPerCategory = extractNumericConst(digestSrc, 'MAX_ITEMS_PER_CATEGORY');
     const digestMaxItems = extractNumericConst(seedDigestSrc, 'DIGEST_MAX_ITEMS');
-    const digestHighLimit = extractNumericConst(seedDigestSrc, 'DIGEST_HIGH_LIMIT');
-    const digestMediumLimit = extractNumericConst(seedDigestSrc, 'DIGEST_MEDIUM_LIMIT');
+    const digestHighLimit = extractNumericConst(digestEmailHtmlSrc, 'DIGEST_HIGH_LIMIT');
+    const digestMediumLimit = extractNumericConst(digestEmailHtmlSrc, 'DIGEST_MEDIUM_LIMIT');
+    const digestCriticalLimit = extractNumericConst(digestEmailHtmlSrc, 'DIGEST_CRITICAL_LIMIT');
+    const digestEmailMaxBytes = extractNumericConst(digestEmailHtmlSrc, 'DIGEST_EMAIL_MAX_HTML_BYTES');
 
     assertDocMatches(new RegExp(`reads at most\\s+\`${itemsPerFeed}\`\\s+items per feed`), 'ITEMS_PER_FEED');
     assertDocMatches(
@@ -716,6 +739,11 @@ describe('news digest methodology parity', () => {
     assertDocMatches(new RegExp(`caps at\\s+\`${digestMaxItems}\`\\s+clusters`), 'DIGEST_MAX_ITEMS');
     assertDocMatches(new RegExp(`high stories at\\s+\`${digestHighLimit}\``), 'DIGEST_HIGH_LIMIT');
     assertDocMatches(new RegExp(`medium stories at\\s+\`${digestMediumLimit}\``), 'DIGEST_MEDIUM_LIMIT');
+    assert.equal(digestCriticalLimit, Infinity, 'docs say critical stories are not capped by count');
+    assertDocMatches(
+      new RegExp(`email HTML at\\s+\`${digestEmailMaxBytes.toLocaleString('en-US')}\`\\s+bytes`),
+      'DIGEST_EMAIL_MAX_HTML_BYTES',
+    );
 
     const readMaxStoriesBody = extractFunctionBody(briefComposeSrc, 'readMaxStoriesPerUser');
     assert.ok(
@@ -762,7 +790,7 @@ describe('news digest methodology parity', () => {
       assert.ok(cacheKeysSrc.includes(field), `cache-key contract comment must mention ${field}`);
       assertDocIncludes(`\`${field}\``, `story-track field ${field}`);
     }
-    const hashSummary = cacheKeysSrc.match(/^\/\/ Hash:[^\n]*(?:\n\/\/       [^\n]*)*/m)?.[0] ?? '';
+    const hashSummary = cacheKeysSrc.match(/^\/\/ Hash:[^\n]*(?:\n\/\/ {7}[^\n]*)*/m)?.[0] ?? '';
     const alwaysWrittenSummary = cacheKeysSrc.match(/story:track:v1:\$\{titleHash\}.*\(always-written\)/)?.[0] ?? '';
     assert.ok(hashSummary.length > 0, 'failed to locate cache-key hash summary comment');
     assert.ok(alwaysWrittenSummary.length > 0, 'failed to locate cache-key always-written summary comment');
@@ -782,17 +810,42 @@ describe('news digest methodology parity', () => {
     assertDocIncludes('`story:track:v1:{titleHash}`', 'story track key');
     assertDocIncludes('7 days', 'story tracking TTL');
     assertDocIncludes('48 hours', 'digest accumulator TTL');
+    assertDocIncludes(
+      `members last seen more than ${ACCUMULATOR_RETENTION_MS / 86_400_000} days ago`,
+      'digest accumulator member retention (ACCUMULATOR_RETENTION_MS)',
+    );
+    assertDocIncludes(
+      'In production, `full:en` is pruned only once `FORECAST_EVIDENCE_CUTOVER_ENABLED` is enabled',
+      'full:en prune gate (#7082)',
+    );
   });
 
   it('documents reserved feed fading phase and digest read-path fading behavior', () => {
+    // #7081 recorded a no-go for the score-ratio fading rule, so the feed digest
+    // no longer has a fading branch at all. The previous form of this guard
+    // pinned that branch's existence; it now pins its ABSENCE, which is the
+    // contract the methodology page describes.
     assert.ok(
-      digestSrc.includes('branch is intentionally') &&
-        digestSrc.includes("return 'STORY_PHASE_FADING'"),
-      'feed digest fading branch must remain explicitly guarded/inactive unless docs are updated',
+      !digestSrc.includes("return 'STORY_PHASE_FADING'"),
+      'the feed digest must not emit STORY_PHASE_FADING — see the #7081 no-go',
+    );
+    const derivePhaseBody = digestSrc.slice(
+      digestSrc.indexOf('function derivePhase('),
+      digestSrc.indexOf('\n}', digestSrc.indexOf('function derivePhase(')),
+    );
+    assert.ok(
+      derivePhaseBody.length > 0
+        && !derivePhaseBody.includes('currentScore')
+        && !derivePhaseBody.includes('peakScore'),
+      'derivePhase must not consume a score — reintroducing one reopens the #7081 no-go',
     );
     assertDocMatches(
-      /`fading`[\s\S]*Reserved for score-history support[\s\S]*zero placeholders[\s\S]*inert/,
+      /`fading`[\s\S]*Reserved\. The feed API does not emit this phase\./,
       'reserved feed fading phase',
+    );
+    assertDocMatches(
+      /The feed API does not emit `fading`[\s\S]*wire enum keeps the value/,
+      'feed fading no-go contract',
     );
     assertDocMatches(
       /notification cron[\s\S]*more than 24 hours of silence[\s\S]*`fading`/,
@@ -803,24 +856,34 @@ describe('news digest methodology parity', () => {
   it('documents regional weekly brief provider chain separately from digest prose', () => {
     const providerNames = [...weeklyBriefSrc.matchAll(/name:\s*'([^']+)'/g)]
       .map((m) => m[1]);
-    const providerModels = [...weeklyBriefSrc.matchAll(/model:\s*'([^']+)'/g)]
-      .map((m) => m[1]);
+    const sharedModels = {
+      OPENROUTER_FREE_BACKUP_MODEL,
+      OPENROUTER_FREE_PRIMARY_MODEL,
+    };
+    const providerModels = [...weeklyBriefSrc.matchAll(/model:\s*(?:'([^']+)'|([A-Z_]+))/g)]
+      .map((m) => m[1] || sharedModels[m[2]]);
     const weeklyTemperature = extractNumericConst(weeklyBriefSrc, 'BRIEF_TEMPERATURE');
 
-    assert.deepEqual(providerNames, ['openrouter', 'groq']);
-    assert.deepEqual(providerModels, ['deepseek/deepseek-v4-flash', 'llama-3.3-70b-versatile']);
+    assert.deepEqual(providerNames, ['openrouter', 'openrouter-free', 'openrouter-free-backup']);
+    assert.deepEqual(providerModels, [
+      'deepseek/deepseek-v4-flash',
+      'google/gemma-4-26b-a4b-it:free',
+      'nvidia/nemotron-3.5-super-vl:free',
+    ]);
     assert.equal(weeklyTemperature, 0.3);
 
     assertDocMatches(
-      /Regional weekly briefs[\s\S]*tr(?:y|ies) OpenRouter first[\s\S]*`deepseek\/deepseek-v4-flash`[\s\S]*Groq `llama-3\.3-70b-versatile`[\s\S]*temperature\s+`0\.3`/,
+      /Regional weekly briefs[\s\S]*tr(?:y|ies) OpenRouter first[\s\S]*`deepseek\/deepseek-v4-flash`[\s\S]*`google\/gemma-4-26b-a4b-it:free`[\s\S]*`nvidia\/nemotron-3\.5-super-vl:free`[\s\S]*temperature\s+`0\.3`/, // pragma: allowlist secret
       'regional weekly brief provider order, models, and temperature',
     );
     assertDocMatches(
       /intentionally differ[\s\S]*digest prose and `whyMatters` surfaces/,
       'regional weekly brief chain differs from digest prose and whyMatters',
     );
+    const briefModel = briefLlmSrc.match(/BRIEF_LLM_OPENROUTER_MODEL = process\.env\.BRIEF_LLM_OPENROUTER_MODEL \|\| '([^']+)'/)?.[1];
+    assert.ok(briefModel, 'BRIEF_LLM_OPENROUTER_MODEL must default to a string literal');
     assertDocMatches(
-      /provider chain to OpenRouter by skipping Ollama and Groq[\s\S]*`google\/gemini-2\.5-flash`/,
+      new RegExp(`provider chain to OpenRouter by skipping Ollama[\\s\\S]*\`${briefModel.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\``),
       'digest prose and whyMatters OpenRouter-only posture',
     );
   });

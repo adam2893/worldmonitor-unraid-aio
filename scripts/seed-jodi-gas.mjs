@@ -9,12 +9,15 @@ import {
   CHROME_UA,
   runSeed,
   writeExtraKey,
-  readSeedSnapshot,
-  extendExistingTtl,
+  readExistingSeedMeta,
 } from './_seed-utils.mjs';
 import {
+  MAX_JODI_CONTENT_AGE_MONTHS,
+  MAX_JODI_GAS_CONTENT_AGE_MIN,
   assessChinaJodiCoverage,
+  buildChinaRowDiagnostic,
   hasFiniteMeasurementAtPaths,
+  jodiDatasetContentMeta,
 } from './shared/jodi-content-age.mjs';
 
 loadEnvFile(import.meta.url);
@@ -26,9 +29,10 @@ const inflateRawAsync = promisify(inflateRaw);
 export const CANONICAL_KEY = 'energy:jodi-gas:v1:_countries';
 export const KEY_PREFIX = 'energy:jodi-gas:v1:';
 export const LNG_VULNERABILITY_KEY = 'energy:lng-vulnerability:v1';
-export const GAS_TTL = 3_024_000;
+export const GAS_TTL = 70 * 24 * 3600; // 70d keeps last-good through the 40d STALE_SEED window and several 15d bundle intervals (#7273)
 
-const ZIP_URL = 'https://www.jodidata.org/jodi-publisher/gas/17/GAS_world_NewFormat.zip';
+const CATALOG_URL = 'https://api.publisher.jodidata.org/web/files/gas';
+const ARCHIVE_ROOT = 'https://www.jodidata.org/jodi-publisher/gas';
 const CSV_FILENAME = 'STAGING_world_NewFormat.csv';
 const UNIT_FILTER = 'TJ';
 export const MIN_COUNTRIES = 50;
@@ -62,7 +66,6 @@ export function parseCsvRows(csvText) {
   const idxFlow   = header.indexOf('FLOW_BREAKDOWN');
   const idxUnit   = header.indexOf('UNIT_MEASURE');
   const idxObs    = header.indexOf('OBS_VALUE');
-  const idxAssess = header.indexOf('ASSESSMENT_CODE');
 
   if (idxArea < 0 || idxPeriod < 0 || idxFlow < 0 || idxUnit < 0 || idxObs < 0) {
     throw new Error('CSV missing required columns');
@@ -77,9 +80,10 @@ export function parseCsvRows(csvText) {
     if (unit !== UNIT_FILTER) continue;
     const flow = cells[idxFlow]?.trim().replace(/^"|"$/g, '');
     if (!FLOW_MAP[flow]) continue;
-    const assessRaw = idxAssess >= 0 ? cells[idxAssess]?.trim().replace(/^"|"$/g, '') : '';
-    const assessNum = Number(assessRaw);
-    if (assessNum !== 1 && assessNum !== 2) continue;
+    // ASSESSMENT_CODE 3 means JODI has not assessed the value, not that it is
+    // missing: China, Russia, Iraq, Indonesia and Malaysia file every gas cell
+    // under it (publication 28). Absence is a non-numeric cell, which
+    // parseObsValue turns into null (#9393 made the same fix for oil).
     const obs = parseObsValue(cells[idxObs]);
     rows.push({
       area:   cells[idxArea]?.trim().replace(/^"|"$/g, ''),
@@ -89,6 +93,46 @@ export function parseCsvRows(csvText) {
     });
   }
   return rows;
+}
+
+function buildMonthRecord(iso2, period, monthRows) {
+  const fields = {};
+  for (const row of monthRows) {
+    const fieldName = FLOW_MAP[row.flow];
+    if (fieldName) fields[fieldName] = row.obs;
+  }
+
+  const lngImports   = fields.lngImportsTj  ?? null;
+  const totalImports = fields.totalImportsTj ?? null;
+  let lngShare = null;
+  if (lngImports !== null && totalImports !== null && totalImports > 0) {
+    lngShare = +(lngImports / totalImports).toFixed(4);
+  }
+
+  return {
+    iso2,
+    dataMonth:         period,
+    productionTj:      fields.productionTj    ?? null,
+    lngImportsTj:      fields.lngImportsTj    ?? null,
+    pipeImportsTj:     fields.pipeImportsTj   ?? null,
+    lngExportsTj:      fields.lngExportsTj    ?? null,
+    pipeExportsTj:     fields.pipeExportsTj   ?? null,
+    totalImportsTj:    fields.totalImportsTj  ?? null,
+    totalDemandTj:     fields.totalDemandTj   ?? null,
+    closingStockTj:    fields.closingStockTj  ?? null,
+    lngShareOfImports: lngShare,
+    seededAt:          new Date().toISOString(),
+  };
+}
+
+/** Whole months from `earlier` to `later` (both YYYY-MM); Infinity if unparseable. */
+function monthsBetween(earlier, later) {
+  const index = (month) => {
+    const match = /^(\d{4})-(\d{2})$/.exec(String(month));
+    return match ? Number(match[1]) * 12 + Number(match[2]) - 1 : NaN;
+  };
+  const gap = index(later) - index(earlier);
+  return Number.isFinite(gap) ? gap : Infinity;
 }
 
 export function buildCountryRecords(rows) {
@@ -101,43 +145,29 @@ export function buildCountryRecords(rows) {
   const records = [];
   for (const [iso2, areaRows] of byArea) {
     const periods = [...new Set(areaRows.map(r => r.period))].sort().reverse();
+    // Take the newest month that meets the gas measurement contract (imports,
+    // demand or LNG share). A newer month that carries only production, stock
+    // or exports — common under code 3 — would otherwise replace it and the
+    // country would fail publication. The look-back stops
+    // MAX_JODI_CONTENT_AGE_MONTHS before the newest numeric month, so a decade-
+    // old import month (Brazil's last is 2015-12) is never published as the
+    // country's profile. With no qualifying month, keep the newest month that
+    // carries any number; publication then filters it out.
+    let fallback = null;
     let chosen = null;
     for (const p of periods) {
-      if (areaRows.some(r => r.period === p)) {
-        chosen = p;
+      const monthRows = areaRows.filter(r => r.period === p);
+      if (!monthRows.some(r => r.obs !== null)) continue;
+      const record = buildMonthRecord(iso2, p, monthRows);
+      fallback ??= record;
+      if (monthsBetween(p, fallback.dataMonth) > MAX_JODI_CONTENT_AGE_MONTHS) break;
+      if (hasGasMeasurements(record)) {
+        chosen = record;
         break;
       }
     }
-    if (!chosen) continue;
-
-    const chosenRows = areaRows.filter(r => r.period === chosen);
-    const fields = {};
-    for (const row of chosenRows) {
-      const fieldName = FLOW_MAP[row.flow];
-      if (fieldName) fields[fieldName] = row.obs;
-    }
-
-    const lngImports   = fields.lngImportsTj  ?? null;
-    const totalImports = fields.totalImportsTj ?? null;
-    let lngShare = null;
-    if (lngImports !== null && totalImports !== null && totalImports > 0) {
-      lngShare = +(lngImports / totalImports).toFixed(4);
-    }
-
-    records.push({
-      iso2,
-      dataMonth:         chosen,
-      productionTj:      fields.productionTj    ?? null,
-      lngImportsTj:      fields.lngImportsTj    ?? null,
-      pipeImportsTj:     fields.pipeImportsTj   ?? null,
-      lngExportsTj:      fields.lngExportsTj    ?? null,
-      pipeExportsTj:     fields.pipeExportsTj   ?? null,
-      totalImportsTj:    fields.totalImportsTj  ?? null,
-      totalDemandTj:     fields.totalDemandTj   ?? null,
-      closingStockTj:    fields.closingStockTj  ?? null,
-      lngShareOfImports: lngShare,
-      seededAt:          new Date().toISOString(),
-    });
+    const record = chosen ?? fallback;
+    if (record) records.push(record);
   }
 
   return records;
@@ -156,39 +186,75 @@ export function assessChinaGasCoverage(records, now = new Date()) {
 }
 
 /**
- * Reject unusable China coverage without letting the prior per-country
- * snapshot expire behind the still-preserved canonical country list.
+ * Content age of the published gas snapshot, for runSeed's content-age
+ * contract. This is the staleness guard that used to ride on China's data
+ * month: when the world file stops advancing, health says STALE_CONTENT
+ * instead of serving a frozen vintage as if it were current.
  *
  * @param {Parameters<typeof assessChinaGasCoverage>[0]} records
  * @param {Date} now
- * @param {{
- *   readSnapshot?: (key: string) => Promise<unknown>,
- *   extendTtl?: (keys: string[], ttlSeconds: number) => Promise<unknown>,
- * }} deps
  */
-export async function enforceChinaGasCoverage(records, now = new Date(), deps = {}) {
-  const chinaCoverage = assessChinaGasCoverage(records, now);
-  if (chinaCoverage.ok) return chinaCoverage;
+export function gasContentMeta(records, now = new Date()) {
+  return jodiDatasetContentMeta(records, hasGasMeasurements, now);
+}
 
-  const readSnapshot = deps.readSnapshot ?? readSeedSnapshot;
-  const extendTtl = deps.extendTtl ?? extendExistingTtl;
-  const previousIso2List = await readSnapshot(CANONICAL_KEY).catch(() => null);
-  const previousCountryKeys = Array.isArray(previousIso2List)
-    ? previousIso2List
-      .filter((iso2) => typeof iso2 === 'string' && /^[A-Z]{2}$/.test(iso2))
-      .map((iso2) => `${KEY_PREFIX}${iso2}`)
-    : [];
-
-  if (previousCountryKeys.length > 0) {
-    await extendTtl(previousCountryKeys, GAS_TTL).catch(() => {});
+/**
+ * Record — never enforce — China's state for seed-meta.
+ *
+ * Until #6395 an unusable China row threw here and discarded all 63 parsed
+ * countries, so the whole dataset froze for 40 days behind one absent record.
+ * The publish now proceeds on the country floor alone (runSeed `validateFn`),
+ * and this diagnostic is what keeps the gap visible on /api/health.
+ *
+ * @param {Parameters<typeof assessChinaGasCoverage>[0]} records
+ * @param {Date} now
+ * @param {{ readPreviousMeta?: () => Promise<any> }} deps
+ */
+export async function buildGasChinaRowDiagnostic(records, now = new Date(), deps = {}) {
+  const readPreviousMeta = deps.readPreviousMeta ?? (() => readExistingSeedMeta('energy', 'jodi-gas'));
+  const previousMeta = await readPreviousMeta();
+  if (previousMeta?.chinaRow == null) {
+    // readExistingSeedMeta collapses "no prior record" and "read failed" into
+    // one null, so an ongoing gap re-dates to this run. Say so, or the reset is
+    // indistinguishable from a genuine new outage in the log.
+    console.warn('  China gas row: no previous record readable — dating any gap from this run');
   }
+  return buildChinaRowDiagnostic(
+    assessChinaGasCoverage(records, now),
+    previousMeta?.chinaRow ?? null,
+    now.getTime(),
+  );
+}
 
-  const error = new Error(`China JODI gas coverage failed: ${chinaCoverage.reason} (dataMonth=${chinaCoverage.dataMonth ?? 'missing'})`);
-  // The coverage result is deterministic for the downloaded snapshot. Tell
-  // runSeed's outer withRetry loop not to download and parse the same ZIP
-  // again after last-good country TTLs have already been preserved.
-  error.nonRetryable = true;
-  throw error;
+/**
+ * Parse a downloaded world file into country records and say, once, what
+ * happened to China. Separated from the download so the no-China path is
+ * exercisable without a network round trip.
+ *
+ * @param {string} csvText
+ * @param {Date} now
+ */
+export function buildGasRecordsFromCsv(csvText, now = new Date()) {
+  const rows = parseCsvRows(csvText);
+  console.log(`  Rows after TJ/flow filter: ${rows.length}`);
+  const parsed = buildCountryRecords(rows);
+
+  const chinaCoverage = assessChinaGasCoverage(parsed, now);
+
+  // A country whose every field parsed to null is not coverage: it would count
+  // toward MIN_COUNTRIES while serving no measurement to anyone. With no
+  // single-country gate standing behind that floor any more (#6395), the floor
+  // has to mean what it says, so only measurement-bearing countries are
+  // published. It also stops a null-only month from overwriting a country's
+  // last-good record — the key simply is not rewritten and ages out instead.
+  const records = parsed.filter(hasGasMeasurements);
+  console.log(`  Countries with gas data: ${records.length} of ${parsed.length} parsed`);
+  console.log(chinaCoverage.ok
+    ? `  China gas coverage: ok (dataMonth=${chinaCoverage.dataMonth})`
+    : `  China gas coverage: ${chinaCoverage.reason} (dataMonth=${chinaCoverage.dataMonth ?? 'missing'})`
+      + ` — publishing the other ${records.length} countries anyway`);
+
+  return records;
 }
 
 function findZipEntry(buf, filename) {
@@ -220,11 +286,35 @@ function findZipEntry(buf, filename) {
   return null;
 }
 
+// Publication IDs identify specific releases. Follow the same catalog as the
+// official download page; a successful fetch of an old ID never finds new data.
+function resolveGasArchiveUrl(catalog) {
+  if (!Number.isSafeInteger(catalog?.publicationId) || catalog.publicationId <= 0
+    || !Array.isArray(catalog.files)) {
+    throw new Error('JODI Gas catalog has no valid publication');
+  }
+  const csvFiles = catalog.files.filter(file => file?.format === 'CSV' && file.ignore === false);
+  if (csvFiles.length !== 1 || csvFiles[0].filename !== 'GAS_world_NewFormat.zip') {
+    throw new Error('JODI Gas catalog must contain one supported CSV archive');
+  }
+  return `${ARCHIVE_ROOT}/${catalog.publicationId}/${csvFiles[0].filename}`;
+}
+
 async function fetchAndParseCsv() {
-  console.log(`  Fetching JODI Gas ZIP from ${ZIP_URL}`);
-  const resp = await fetch(ZIP_URL, {
+  // Discovery and archive download share the existing total request budget.
+  const signal = AbortSignal.timeout(120_000);
+  const catalogResponse = await fetch(CATALOG_URL, {
+    headers: { 'User-Agent': CHROME_UA },
+    signal,
+    redirect: 'error',
+  });
+  if (!catalogResponse.ok) throw new Error(`JODI Gas catalog fetch failed: HTTP ${catalogResponse.status}`);
+  const zipUrl = resolveGasArchiveUrl(await catalogResponse.json());
+  console.log(`  Fetching JODI Gas ZIP from ${zipUrl}`);
+  const resp = await fetch(zipUrl, {
     headers: { 'User-Agent': CHROME_UA, 'Accept-Encoding': 'identity' },
-    signal: AbortSignal.timeout(120_000),
+    signal,
+    redirect: 'error',
   });
   if (!resp.ok) throw new Error(`JODI Gas ZIP fetch failed: HTTP ${resp.status}`);
 
@@ -251,15 +341,10 @@ async function fetchAndParseCsv() {
   return csvText;
 }
 
-async function fetchJodiGas() {
+export async function fetchJodiGas() {
   const csvText = await fetchAndParseCsv();
   console.log('  Parsing CSV rows...');
-  const rows = parseCsvRows(csvText);
-  console.log(`  Rows after TJ/flow/assessment filter: ${rows.length}`);
-  const records = buildCountryRecords(rows);
-  console.log(`  Countries with gas data: ${records.length}`);
-  await enforceChinaGasCoverage(records);
-  return records;
+  return buildGasRecordsFromCsv(csvText);
 }
 
 /**
@@ -287,6 +372,8 @@ export function buildLngVulnerabilityIndex(members, dataMonth, updatedAt) {
       iso2: r.iso2,
       lngShareOfImports: /** @type {number} */ (r.lngShareOfImports),
       lngImportsTj: /** @type {number} */ (r.lngImportsTj),
+      // Each country publishes its own newest reported month.
+      dataMonth: r.dataMonth,
     }));
 
   const top20PipelineDependent = withPipe
@@ -296,6 +383,8 @@ export function buildLngVulnerabilityIndex(members, dataMonth, updatedAt) {
       iso2: r.iso2,
       lngShareOfImports: /** @type {number} */ (r.lngShareOfImports),
       pipeImportsTj: /** @type {number} */ (r.pipeImportsTj),
+      // Each country publishes its own newest reported month.
+      dataMonth: r.dataMonth,
     }));
 
   return { updatedAt, dataMonth, top20LngDependent, top20PipelineDependent };
@@ -331,11 +420,14 @@ if (isMain) {
         await writeExtraKey(`${KEY_PREFIX}${record.iso2}`, record, GAS_TTL);
       }
       // LNG vulnerability index is now written via extraKeys (gets TTL-preserved on failure)
+      return { freshnessMetaPatch: { chinaRow: await buildGasChinaRowDiagnostic(records) } };
     },
-  
+    contentMeta: gasContentMeta,
+    maxContentAgeMin: MAX_JODI_GAS_CONTENT_AGE_MIN,
+
     declareRecords,
     schemaVersion: 1,
-    maxStaleMin: 57600,
+    maxStaleMin: 40 * 24 * 60, // 40d allows missed 15d bundle intervals and must stay below GAS_TTL (#7273)
     sourceVersion: 'jodi-gas-v1',
   });
 }

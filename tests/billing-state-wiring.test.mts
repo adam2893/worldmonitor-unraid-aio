@@ -15,8 +15,9 @@ const read = (path: string) => readFile(new URL(`../${path}`, import.meta.url), 
 describe('payment-failure-banner billing-state wiring (#4771)', () => {
   it('derives the banner from the shared billing UX state, not raw on_hold checks', async () => {
     const src = await read('src/components/payment-failure-banner.ts');
-    assert.match(src, /deriveBillingUxState\(getSubscription\(\), getEntitlementState\(\), Date\.now\(\)\)/);
-    assert.match(src, /getBillingBannerVariant\(/);
+    assert.match(src, /const sub = getSubscription\(\);/);
+    assert.match(src, /deriveBillingUxState\(sub, getEntitlementState\(\), Date\.now\(\)\)/);
+    assert.match(src, /getBillingBannerVariant\(state, sub\?\.billingEmailBounced === true\)/);
     assert.doesNotMatch(
       src,
       /sub\.status !== 'on_hold'/,
@@ -39,8 +40,10 @@ describe('payment-failure-banner billing-state wiring (#4771)', () => {
 
   it('resolves banner copy through i18n with the variant keys', async () => {
     const src = await read('src/components/payment-failure-banner.ts');
-    assert.match(src, /t\(variant\.messageKey\)/);
-    assert.match(src, /t\(variant\.actionLabelKey\)/);
+    // The message carries the bounced address, so it is set as text, never
+    // interpolated into the trusted template.
+    assert.match(src, /message\.textContent = t\(variant\.messageKey, \{ email: billingEmail \}\)/);
+    assert.match(src, /t\(action\.labelKey\)/);
   });
 
   it('tears down a stale banner on variant switch and short-circuits same-variant re-renders', async () => {
@@ -48,11 +51,14 @@ describe('payment-failure-banner billing-state wiring (#4771)', () => {
     // A pending→failed transition must remove the old element and rebuild;
     // a same-variant event must not stack a duplicate. Dropping either half
     // ships stacked/stale banners invisibly (no jsdom in this suite).
+    // A changed bounced address must rebuild too, unless the repair form is
+    // open; the element carries both identities.
     assert.match(
       src,
-      /if \(existing\) \{\s*\n\s*if \(existingVariant === variant\.dismissKey\) return;\s*\n\s*existing\.remove\(\);\s*\n\s*\}/,
+      /if \(existing\) \{\s*\n\s*if \(existingVariant === variant\.dismissKey\s*\n\s*&& \(existing\.dataset\.email === billingEmail \|\| existing\.querySelector\('#pf-email-form'\)\)\) return;\s*\n\s*existing\.remove\(\);\s*\n\s*\}/,
     );
     assert.match(src, /banner\.dataset\.variant = variant\.dismissKey;/);
+    assert.match(src, /banner\.dataset\.email = billingEmail;/);
   });
 
   it('every banner variant key resolves in en.json, and on_hold copy is byte-identical to the pre-#4771 banner', async () => {
@@ -63,11 +69,12 @@ describe('payment-failure-banner billing-state wiring (#4771)', () => {
     };
     const billingState = en.components.billingState;
     const { getBillingBannerVariant } = await import('../src/services/billing-state.ts');
-    for (const state of ['on_hold', 'renewal_verification_pending', 'renewal_verification_failed'] as const) {
-      const v = getBillingBannerVariant(state);
-      assert.ok(v);
-      for (const key of [v.messageKey, v.actionLabelKey]) {
-        if (key === null) continue;
+    const variants = (['on_hold', 'renewal_verification_pending', 'renewal_verification_failed', 'active'] as const)
+      .flatMap((state) => [getBillingBannerVariant(state), getBillingBannerVariant(state, true)])
+      .filter((v) => v !== null);
+    assert.equal(variants.length, 7);
+    for (const v of variants) {
+      for (const key of [v.messageKey, ...v.actions.map((a) => a.labelKey)]) {
         const leaf = key.replace('components.billingState.', '');
         assert.equal(typeof billingState[leaf], 'string', `${key} must exist in en.json`);
       }
@@ -96,7 +103,10 @@ describe('panel-layout billing-state wiring (#4771)', () => {
   });
 
   it('routes billing-portal gate actions through the popup-blocker-safe pre-reserve pattern', async () => {
-    const src = await read('src/app/panel-layout.ts');
+    // The gate-action switch was extracted from PanelLayoutManager into the
+    // shared resolveGateAction (plan 2026-07-25-001 U5) so the export gate and
+    // tab cap inherit the same billing-portal handling.
+    const src = await read('src/services/panel-gating.ts');
     assert.match(src, /case PanelGateReason\.PAYMENT_ON_HOLD:\s*\n\s*case PanelGateReason\.RENEWAL_FAILED:/);
     assert.match(src, /prereserveBillingPortalTab\(\)/);
   });
@@ -115,6 +125,105 @@ describe('widget-agent structured billing denial (#4771)', () => {
       'billing-verification denial must run BEFORE the generic Pro-subscription-required 403',
     );
   });
+});
+
+describe('Pro-gated endpoint policy and billing denial ordering (#5600, #5646)', () => {
+  // Content-only endpoints delegate the complete role-or-tier decision to
+  // checkProEntitlement. Notification-backed entry points use the tier-only
+  // helper to match their configuration and delivery paths. notification-
+  // channels retains its handler-level seam because it also owns denial-capture
+  // observability.
+  //
+  // These are source-order assertions, the same shape as the widget-agent block
+  // above: they pin integration and ordering, while the shared helper's truth
+  // table is behavior-tested in tests/pro-json-entitlement-gates.test.mts.
+  const endpoints: Array<{
+    file: string;
+    decisionCall?: string;
+    decisionHelper?: string;
+  }> = [
+    {
+      file: 'api/latest-brief.ts',
+      decisionCall: 'checkProEntitlement(session.userId, session.role, cors)',
+      decisionHelper: 'checkProEntitlement',
+    },
+    {
+      file: 'api/notify.ts',
+      decisionCall: 'checkTierProEntitlement(session.userId, cors)',
+      decisionHelper: 'checkTierProEntitlement',
+    },
+    {
+      file: 'api/brief/share-url.ts',
+      decisionCall: 'checkProEntitlement(session.userId, session.role, cors)',
+      decisionHelper: 'checkProEntitlement',
+    },
+    {
+      file: 'api/slack/oauth/start.ts',
+      decisionCall: 'checkTierProEntitlement(session.userId, corsHeaders)',
+      decisionHelper: 'checkTierProEntitlement',
+    },
+    {
+      file: 'api/discord/oauth/start.ts',
+      decisionCall: 'checkTierProEntitlement(session.userId, corsHeaders)',
+      decisionHelper: 'checkTierProEntitlement',
+    },
+    { file: 'api/notification-channels.ts' },
+  ];
+
+  for (const { file, decisionCall, decisionHelper } of endpoints) {
+    it(`${file} evaluates its shared decision before the generic 403`, async () => {
+      const src = await read(file);
+      const decisionIdx = decisionCall
+        ? src.indexOf(decisionCall)
+        : src.indexOf('getBillingVerificationDenial(ent');
+      const genericIdx = src.indexOf("error: 'pro_required'");
+
+      if (decisionCall) {
+        assert.ok(
+          src.includes(`import { ${decisionHelper} } from`) &&
+            src.includes("pro-entitlement';"),
+          `${file} must import ${decisionHelper}`,
+        );
+        assert.match(
+          src,
+          /if \(!proAccess\.allowed\)/,
+          `${file} must deny only after the shared helper rejects both Pro signals`,
+        );
+        assert.match(src, /const \{ billingDenial \} = proAccess;/);
+      }
+
+      assert.ok(decisionIdx > 0, `${file} must evaluate its shared entitlement decision`);
+      assert.ok(genericIdx > 0, `${file} should keep the generic pro_required 403 for true free users`);
+      assert.ok(
+        decisionIdx < genericIdx,
+        `${file}: the entitlement decision must run BEFORE the generic pro_required 403`,
+      );
+      assert.match(
+        src,
+        /if \(billingDenial\)/,
+        `${file} must return the denial Response when the helper produces one`,
+      );
+    });
+  }
+
+  for (const file of [
+    'api/notify.ts',
+    'api/slack/oauth/start.ts',
+    'api/discord/oauth/start.ts',
+  ]) {
+    it(`${file} does not grant notification access from Clerk role alone`, async () => {
+      const src = await read(file);
+
+      assert.doesNotMatch(
+        src,
+        /checkProEntitlement\(session\.userId,\s*session\.role,/,
+      );
+      assert.match(
+        src,
+        /checkTierProEntitlement\(session\.userId,\s*(?:cors|corsHeaders)\)/,
+      );
+    });
+  }
 });
 
 describe('Panel CTA copy coverage (#4771)', () => {
@@ -138,5 +247,38 @@ describe('Panel CTA copy coverage (#4771)', () => {
       /t\('premium\.billing/,
       'premium.* is shell-inlined at first paint; billing CTA copy must live under components.billingState',
     );
+  });
+});
+
+describe('returning-subscriber surfaces (#4799)', () => {
+  it('uses the lapsed billing state and prior plan on the Pro banner', async () => {
+    const src = await read('src/components/ProBanner.ts');
+    assert.match(src, /deriveBillingUxState\(/);
+    assert.match(src, /onSubscriptionChange\(/);
+    assert.match(src, /components\.billingState\.lapsedDesc/);
+    assert.match(src, /components\.billingState\.resubscribe/);
+    assert.match(src, /getReactivationHref\(/);
+    assert.match(src, /cancelPendingBannerRemoval\(\)/);
+    assert.match(src, /pendingBannerRemoval/);
+    assert.match(
+      src,
+      /if \(dismissedThisSession\) return;\s+cancelPendingBannerRemoval\(\);\s+bannerEl\?\.classList\.remove\('pro-banner-out'\);/,
+      'reversed entitlement fades must restore visibility without cancelling explicit dismissals',
+    );
+  });
+
+  it('uses the lapsed billing state and prior plan in Unified Settings', async () => {
+    const src = await read('src/components/UnifiedSettings.ts');
+    assert.match(src, /deriveBillingUxState\(/);
+    assert.match(src, /onSubscriptionChange\(/);
+    assert.match(src, /components\.billingState\.lapsedDesc/);
+    assert.match(src, /components\.billingState\.resubscribe/);
+    assert.match(src, /getReactivationHref\(/);
+  });
+
+  it('lets the pricing page honor a returning subscriber plan preference', async () => {
+    const src = await read('pro-test/src/components/PricingSection.tsx');
+    assert.match(src, /wm_reactivate_plan/);
+    assert.match(src, /endsWith\('_annual'\)/);
   });
 });

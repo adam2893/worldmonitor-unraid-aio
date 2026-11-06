@@ -30,6 +30,12 @@ export interface FireDetection {
   region: string;
   dayNight: string;
   possibleExplosion: boolean;
+  source: string;
+  kind: string;
+  emergency: boolean;
+  agencyFireId: string;
+  agencyCode: string;
+  fireSize: number;
 }
 
 export interface GeoCoordinates {
@@ -143,7 +149,7 @@ export function createWildfireServiceRoutes(
           if (options?.onError) {
             return options.onError(err, req);
           }
-          const message = err instanceof Error ? err.message : String(err);
+          const message = "Internal server error";
           return new Response(JSON.stringify({ message }), {
             status: 500,
             headers: { "Content-Type": "application/json" },

@@ -5,9 +5,10 @@ import { getLatestRadiationWatch, type RadiationObservation } from './radiation'
 import type { CascadeResult, CascadeImpactLevel } from '@/types';
 import { isInLearningMode } from './country-instability';
 import { getCachedCountryScores, isElevatedCiiScore } from './cached-risk-scores';
-import { getCountryNameByCode } from './country-geometry';
+import { getCountryAtCoordinates, getCountryNameByCode } from './country-geometry';
 import { t } from '@/services/i18n';
 import type { TheaterPostureSummary } from '@/services/military-surge';
+import { detectCiiScoreChanges } from './cii-score-changes';
 
 export type AlertPriority = 'critical' | 'high' | 'medium' | 'low';
 export type AlertType = 'convergence' | 'cii_spike' | 'cascade' | 'sanctions' | 'radiation' | 'composite';
@@ -101,7 +102,7 @@ export interface StrategicRiskOverview {
 }
 
 const alerts: UnifiedAlert[] = [];
-const previousCIIScores = new Map<string, number>();
+let previousCIIScores = new Map<string, number>();
 const ALERT_MERGE_WINDOW_MS = 2 * 60 * 60 * 1000;
 const ALERT_MERGE_DISTANCE_KM = 200;
 
@@ -183,7 +184,8 @@ function getPriorityFromRadiation(observation: RadiationObservation, spikeCount:
 }
 
 function buildConvergenceAlert(convergence: GeoConvergenceAlert, alertId: string): UnifiedAlert {
-  const location = getCountriesNearLocation(convergence.lat, convergence.lon).join(', ') || 'Unknown';
+  const countries = getCountriesAtLocation(convergence.lat, convergence.lon);
+  const location = countries.join(', ') || 'Unknown';
   return {
     id: alertId,
     type: 'convergence',
@@ -192,7 +194,7 @@ function buildConvergenceAlert(convergence: GeoConvergenceAlert, alertId: string
     summary: t('alerts.eventsDetected', { count: convergence.totalEvents, lat: convergence.lat.toFixed(1), lon: convergence.lon.toFixed(1) }),
     components: { convergence },
     location: { lat: convergence.lat, lon: convergence.lon },
-    countries: getCountriesNearLocation(convergence.lat, convergence.lon),
+    countries,
     timestamp: new Date(),
   };
 }
@@ -341,7 +343,7 @@ function createRadiationAlert(): UnifiedAlert | null {
   const strongest = [...anomalies].sort((a, b) => getRadiationRank(b) - getRadiationRank(a))[0];
   if (!strongest) return null;
 
-  const countries = strongest.country ? [strongest.country] : getCountriesNearLocation(strongest.lat, strongest.lon);
+  const countries = strongest.country ? [strongest.country] : getCountriesAtLocation(strongest.lat, strongest.lon);
   const radiation: RadiationAlert = {
     siteId: strongest.id,
     siteName: strongest.location,
@@ -539,30 +541,9 @@ function addAndMergeAlert(alert: UnifiedAlert): UnifiedAlert {
   return alert;
 }
 
-function getCountriesNearLocation(lat: number, lon: number): string[] {
-  const countries: string[] = [];
-
-  const regionCountries = {
-    europe: ['DE', 'FR', 'GB', 'PL', 'UA'],
-    middle_east: ['IR', 'IL', 'SA', 'TR', 'SY', 'YE'],
-    east_asia: ['CN', 'TW', 'KP'],
-    south_asia: ['IN', 'PK', 'MM'],
-    americas: ['US', 'VE'],
-  } as const;
-
-  if (lat > 35 && lat < 70 && lon > -10 && lon < 40) {
-    countries.push(...regionCountries.europe);
-  } else if (lat > 15 && lat < 45 && lon > 25 && lon < 65) {
-    countries.push(...regionCountries.middle_east);
-  } else if (lat > 15 && lat < 55 && lon > 100 && lon < 145) {
-    countries.push(...regionCountries.east_asia);
-  } else if (lat > 5 && lat < 40 && lon > 65 && lon < 100) {
-    countries.push(...regionCountries.south_asia);
-  } else if (lat > -60 && lat < 70 && lon > -130 && lon < -30) {
-    countries.push(...regionCountries.americas);
-  }
-
-  return countries;
+function getCountriesAtLocation(lat: number, lon: number): string[] {
+  const country = getCountryAtCoordinates(lat, lon);
+  return country ? [country.code] : [];
 }
 
 export function checkCIIChanges(): UnifiedAlert[] {
@@ -572,26 +553,21 @@ export function checkCIIChanges(): UnifiedAlert[] {
   // Skip alerting during learning mode - data not yet reliable
   const inLearning = isInLearningMode();
 
-  for (const score of scores) {
-    const previous = previousCIIScores.get(score.code) ?? score.score;
-    const change = score.score - previous;
-
-    // Only emit alerts after learning period completes
-    if (!inLearning && Math.abs(change) >= 10) {
+  const detected = detectCiiScoreChanges(scores, previousCIIScores, inLearning);
+  for (const { score, previousScore } of detected.changes) {
       const driver = getHighestComponent(score);
       const alert = createCIIAlert(
         score.code,
         score.name,
-        previous,
+        previousScore,
         score.score,
         score.level,
         driver
       );
       if (alert) newAlerts.push(alert);
-    }
-
-    previousCIIScores.set(score.code, score.score);
   }
+
+  previousCIIScores = detected.nextScores;
 
   return newAlerts;
 }
@@ -608,8 +584,8 @@ function getHighestComponent(score: CountryScore): string {
 function updateAlerts(convergenceAlerts: GeoConvergenceAlert[]): void {
   // Prune old alerts (older than 24 hours)
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  while (alerts.length > 0 && alerts[0]!.timestamp.getTime() < cutoff) {
-    alerts.shift();
+  for (let i = alerts.length - 1; i >= 0; i--) {
+    if (alerts[i]!.timestamp.getTime() < cutoff) alerts.splice(i, 1);
   }
 
   // Add convergence alerts (addAndMergeAlert handles deduplication by stable ID)
@@ -815,11 +791,6 @@ export function getAlerts(): UnifiedAlert[] {
 export function getRecentAlerts(hours: number = 24): UnifiedAlert[] {
   const cutoff = Date.now() - hours * 60 * 60 * 1000;
   return alerts.filter(a => a.timestamp.getTime() > cutoff);
-}
-
-export function clearAlerts(): void {
-  alerts.length = 0;
-  previousCIIScores.clear();
 }
 
 export function getAlertCount(): { critical: number; high: number; medium: number; low: number } {

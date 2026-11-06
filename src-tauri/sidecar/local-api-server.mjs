@@ -1,20 +1,31 @@
 #!/usr/bin/env node
 import http, { createServer } from 'node:http';
 import https from 'node:https';
-import { createHmac } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import dns from 'node:dns/promises';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { isIP } from 'node:net';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import { brotliCompress, gzipSync } from 'node:zlib';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const sharedResourceRoot = process.env.LOCAL_API_RESOURCE_DIR
+  || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const { getConfiguredLlmHealthProviders } = await import(
+  pathToFileURL(path.join(sharedResourceRoot, 'shared/llm-health-providers.js')).href
+);
+const { isSelfHostRelayPath } = await import(
+  pathToFileURL(path.join(sharedResourceRoot, 'shared/selfhost-relay-paths.js')).href
+);
 
 const brotliCompressAsync = promisify(brotliCompress);
-const DESKTOP_AUTH_SECRET_ENV = 'WM_DESKTOP_SHARED_SECRET';
-const DESKTOP_AUTH_TIMESTAMP_HEADER = 'X-WorldMonitor-Desktop-Timestamp';
-const DESKTOP_AUTH_SIGNATURE_HEADER = 'X-WorldMonitor-Desktop-Signature';
+const LOCAL_API_TRANSPORT_HEADER = 'x-worldmonitor-local-token';
+const MAX_REGISTRATION_BODY_BYTES = 16 * 1024;
+const MAX_REGISTRATION_EMAIL_LENGTH = 254;
 
 // Monkey-patch globalThis.fetch to force IPv4 for HTTPS requests.
 // Node.js built-in fetch (undici) tries IPv6 first via Happy Eyeballs.
@@ -23,7 +34,20 @@ const DESKTOP_AUTH_SIGNATURE_HEADER = 'X-WorldMonitor-Desktop-Signature';
 // fetch() calls in dynamically-loaded handler modules (api/*.js) use IPv4.
 const _originalFetch = globalThis.fetch;
 const ALLOW_PRIVATE_NETWORK_FETCH = Symbol('worldmonitor.allowPrivateNetworkFetch');
+// Resolve at response headers with a streaming body instead of buffering the
+// whole response. Only the self-host relay asks for it: /api/chat-analyst
+// answers text/event-stream, which a buffered fetch would hold until the end.
+const STREAM_RESPONSE_FETCH = Symbol('worldmonitor.streamResponseFetch');
+// Socket inactivity bound for a streamed body. An SSE answer can pause while
+// the model thinks; this matches nginx's 120s proxy_read_timeout on /api/.
+const STREAM_BODY_IDLE_TIMEOUT_MS = 120_000;
 const sidecarAllowedPrivateFetchOrigins = new Set();
+// The sidecar's own listen origins. A fetch to one of these is a nested call
+// into this same process (MCP registry tools call sibling /api routes this
+// way), not an upstream request, so it must not hold an upstream slot: the
+// nested handler's own upstream fetches draw from the same pool, and six
+// concurrent self-calls would otherwise wedge until their timeouts fire.
+const sidecarSelfFetchOrigins = new Set();
 
 function normalizeRequestBody(body) {
   if (body == null) return null;
@@ -56,20 +80,13 @@ function buildSafeResponse(statusCode, statusText, headers, bodyBuffer) {
   return new Response(body, { status, statusText, headers });
 }
 
-function canonicalizeDesktopAuthPayload(payload) {
-  return JSON.stringify({
-    email: typeof payload?.email === 'string' ? payload.email : '',
-    source: typeof payload?.source === 'string' ? payload.source : '',
-    appVersion: typeof payload?.appVersion === 'string' ? payload.appVersion : '',
-    referredBy: typeof payload?.referredBy === 'string' ? payload.referredBy : '',
-    website: typeof payload?.website === 'string' ? payload.website : '',
-    turnstileToken: typeof payload?.turnstileToken === 'string' ? payload.turnstileToken : '',
-  });
-}
-
-function signDesktopAuthPayload(secret, timestamp, payload) {
-  const message = `${timestamp}\n${canonicalizeDesktopAuthPayload(payload)}`;
-  return `sha256=${createHmac('sha256', secret).update(message).digest('hex')}`;
+// Constant-time token check. Only the length can differ in timing, and the
+// token length is not secret; the content is compared with timingSafeEqual.
+function tokenMatches(candidate, expected) {
+  if (typeof candidate !== 'string' || !candidate) return false;
+  const a = Buffer.from(candidate, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 function isTransientVerificationError(error) {
@@ -86,6 +103,20 @@ function isTransientVerificationError(error) {
 let _activeUpstream = 0;
 const _upstreamQueue = [];
 const MAX_CONCURRENT_UPSTREAM = 6;
+// Inactivity timeout for ipv4Fetch's upstream requests. req.setTimeout fires
+// after this many ms with NO socket activity (it resets on data, so a slow
+// but active transfer is unaffected) -- protects against a peer that accepts
+// the connection and then goes fully silent (no FIN/RST, no more bytes),
+// which none of the other terminal-event listeners below ever observe.
+// Matches fetchWithTimeout()'s own default timeoutMs for consistency.
+// Mutable (not const) only so tests can shrink it -- production always runs
+// at the default.
+let _upstreamIdleTimeoutMs = 12000;
+// The configured Ollama server sends nothing until a non-streaming completion
+// ends, so its silence is inference. This bound outlasts the longest server
+// LLM deadline (60s), so the caller's own deadline ends a slow completion and
+// this only reclaims a slot from a server that truly hangs.
+let _ollamaIdleTimeoutMs = 90000;
 function acquireUpstreamSlot() {
   if (_activeUpstream < MAX_CONCURRENT_UPSTREAM) {
     _activeUpstream++;
@@ -99,6 +130,18 @@ function releaseUpstreamSlot() {
   } else {
     _activeUpstream--;
   }
+}
+
+// JSON literal safe to interpolate into an inline <script>: escapes the
+// characters that can close the element or start an HTML comment.
+function jsonForScript(value) {
+  return JSON.stringify(value).replace(/[<>&\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
+function isYahooFinanceHost(hostname) {
+  // URL keeps a DNS-absolute trailing dot, which still names the same host.
+  const host = hostname.endsWith('.') ? hostname.slice(0, -1) : hostname;
+  return host === 'finance.yahoo.com' || host.endsWith('.finance.yahoo.com');
 }
 
 // Global Yahoo Finance rate gate — shared across ALL handler bundles.
@@ -165,19 +208,37 @@ function makePinnedLookup(address, family = 4) {
 }
 
 function registerSidecarAllowedPrivateFetchOrigins(port, extraOrigins = []) {
-  const origins = [
-    `http://127.0.0.1:${port}`,
-    `http://localhost:${port}`,
-    ...extraOrigins,
+  // Normalize through URL so a default port (80) compares equal to
+  // `url.origin`, which omits it: `http://127.0.0.1:80` never matches
+  // `new URL('http://127.0.0.1:80/x').origin === 'http://127.0.0.1'`.
+  const selfOrigins = [
+    new URL(`http://127.0.0.1:${port}`).origin,
+    new URL(`http://localhost:${port}`).origin,
   ];
+  const origins = [...selfOrigins, ...extraOrigins];
   for (const origin of origins) sidecarAllowedPrivateFetchOrigins.add(origin);
+  for (const origin of selfOrigins) sidecarSelfFetchOrigins.add(origin);
   return () => {
     for (const origin of origins) sidecarAllowedPrivateFetchOrigins.delete(origin);
+    for (const origin of selfOrigins) sidecarSelfFetchOrigins.delete(origin);
   };
 }
 
+function isConfiguredOllamaOrigin(url) {
+  if (!process.env.OLLAMA_API_URL) return false;
+  try {
+    return url.origin === new URL(process.env.OLLAMA_API_URL).origin;
+  } catch {
+    return false;
+  }
+}
+
 function isAllowedPrivateSidecarFetch(url) {
-  return sidecarAllowedPrivateFetchOrigins.has(url.origin);
+  if (sidecarAllowedPrivateFetchOrigins.has(url.origin)) return true;
+  // Desktop users can change Ollama settings without restarting the sidecar.
+  // Trust only the current configured origin, never an address from a request.
+  // An invalid configuration grants no private-network access.
+  return process.env.LOCAL_API_MODE === 'tauri-sidecar' && isConfiguredOllamaOrigin(url);
 }
 
 async function assertSafeSidecarFetchUrl(url) {
@@ -195,14 +256,15 @@ async function assertSafeSidecarFetchUrl(url) {
 globalThis.fetch = async function ipv4Fetch(input, init) {
   const isRequest = input && typeof input === 'object' && 'url' in input;
   let url;
-  try { url = new URL(typeof input === 'string' ? input : input.url); } catch { return _originalFetch(input, init); }
+  try { url = new URL(isRequest ? input.url : input); } catch { return _originalFetch(input, init); }
   if (url.protocol !== 'https:' && url.protocol !== 'http:') return _originalFetch(input, init);
   const allowPrivateNetwork = init?.[ALLOW_PRIVATE_NETWORK_FETCH] === true;
   const safety = allowPrivateNetwork
     ? { safe: true, resolvedAddresses: [url.hostname] }
     : await assertSafeSidecarFetchUrl(url);
-  if (url.hostname.includes('finance.yahoo.com')) await sidecarYahooGate();
-  await acquireUpstreamSlot();
+  if (isYahooFinanceHost(url.hostname)) await sidecarYahooGate();
+  const holdsUpstreamSlot = !sidecarSelfFetchOrigins.has(url.origin);
+  if (holdsUpstreamSlot) await acquireUpstreamSlot();
   try {
     const mod = url.protocol === 'https:' ? https : http;
     const method = init?.method || (isRequest ? input.method : 'GET');
@@ -229,10 +291,48 @@ globalThis.fetch = async function ipv4Fetch(input, init) {
     if (pinned) {
       requestOptions.lookup = makePinnedLookup(pinned.address, pinned.family);
     }
+    // Settle idempotently and reject on every stream event that can leave a
+    // response mid-flight (upstream accepts the connection, sends headers,
+    // then stalls) — not just `res 'end'` / `req 'error'`. Without this, a
+    // stalled response never settles the Promise, the `finally` below never
+    // runs, and one upstream slot leaks permanently (#5441).
     return await new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (fn, v) => { if (settled) return; settled = true; fn(v); };
+      // Check before ever dispatching to the network: if the caller's signal
+      // already fired (e.g. while we were awaiting the SSRF check or the
+      // upstream-slot queue above), honor it now instead of wasting a slot
+      // on a request nobody wants (#5441 follow-up review).
+      if (init?.signal?.aborted) {
+        settle(reject, new Error('aborted by signal'));
+        return;
+      }
       const req = mod.request(requestOptions, (res) => {
+        if (init?.[STREAM_RESPONSE_FETCH] === true) {
+          const responseHeaders = new Headers();
+          for (const [k, v] of Object.entries(res.headers)) {
+            if (v) responseHeaders.set(k, Array.isArray(v) ? v.join(', ') : v);
+          }
+          const status = Number.isInteger(res.statusCode) ? res.statusCode : 502;
+          const bodyless = method === 'HEAD' || status === 204 || status === 205 || status === 304;
+          // The caller's deadline covered time to headers; the body is bounded by
+          // inactivity and by the client, which destroys it when it goes away.
+          req.setTimeout(STREAM_BODY_IDLE_TIMEOUT_MS, () => req.destroy(new Error('upstream stream idle-timed out')));
+          if (bodyless) res.resume();
+          try {
+            settle(resolve, new Response(bodyless ? null : Readable.toWeb(res), {
+              status, statusText: res.statusMessage, headers: responseHeaders,
+            }));
+          } catch (error) {
+            res.destroy();
+            settle(reject, error);
+          }
+          return;
+        }
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
+        res.on('error', (e) => settle(reject, e));
+        res.on('aborted', () => settle(reject, new Error('upstream response aborted mid-body')));
         res.on('end', () => {
           const buf = Buffer.concat(chunks);
           const responseHeaders = new Headers();
@@ -240,33 +340,54 @@ globalThis.fetch = async function ipv4Fetch(input, init) {
             if (v) responseHeaders.set(k, Array.isArray(v) ? v.join(', ') : v);
           }
           try {
-            resolve(buildSafeResponse(res.statusCode, res.statusMessage, responseHeaders, buf));
+            settle(resolve, buildSafeResponse(res.statusCode, res.statusMessage, responseHeaders, buf));
           } catch (error) {
-            reject(error);
+            settle(reject, error);
           }
         });
       });
-      req.on('error', reject);
-      if (init?.signal) { init.signal.addEventListener('abort', () => req.destroy()); }
+      req.on('error', (e) => settle(reject, e));
+      req.on('close', () => settle(reject, new Error('request closed before completion')));
+      // Catches a peer that accepts the connection and then goes silent
+      // forever (no error, no close, no data) -- the only stall shape none
+      // of the listeners above ever observe.
+      // A streamed (relay) request carries its own time-to-headers deadline in
+      // init.signal, so the generic 12s idle limit must not cut it short.
+      const idleTimeoutMs = init?.[STREAM_RESPONSE_FETCH] === true
+        ? STREAM_BODY_IDLE_TIMEOUT_MS
+        : isConfiguredOllamaOrigin(url) ? _ollamaIdleTimeoutMs : _upstreamIdleTimeoutMs;
+      req.setTimeout(idleTimeoutMs, () => {
+        req.destroy();
+        settle(reject, new Error('upstream request idle-timed out'));
+      });
+      if (init?.signal) {
+        init.signal.addEventListener('abort', () => { req.destroy(); settle(reject, new Error('aborted by signal')); });
+      }
       if (body != null) req.write(body);
       req.end();
     });
   } finally {
-    releaseUpstreamSlot();
+    if (holdsUpstreamSlot) releaseUpstreamSlot();
   }
 };
 
 const ALLOWED_ENV_KEYS = new Set([
-  'GROQ_API_KEY', 'OPENROUTER_API_KEY', 'EXA_API_KEYS', 'BRAVE_API_KEYS', 'SERPAPI_API_KEYS', 'FRED_API_KEY', 'EIA_API_KEY',
+  'OPENROUTER_API_KEY', 'EXA_API_KEYS', 'BRAVE_API_KEYS', 'SERPAPI_API_KEYS', 'FRED_API_KEY', 'EIA_API_KEY',
   'CLOUDFLARE_API_TOKEN', 'ACLED_ACCESS_TOKEN', 'URLHAUS_AUTH_KEY',
   'OTX_API_KEY', 'ABUSEIPDB_API_KEY', 'WINGBITS_API_KEY', 'WS_RELAY_URL',
   'VITE_OPENSKY_RELAY_URL', 'OPENSKY_CLIENT_ID', 'OPENSKY_CLIENT_SECRET',
-  'AISSTREAM_API_KEY', 'VITE_WS_RELAY_URL', 'FINNHUB_API_KEY', 'NASA_FIRMS_API_KEY',
+  'AISSTREAM_API_KEY', 'VITE_WS_RELAY_URL', 'FINNHUB_API_KEY', 'ALPHA_VANTAGE_API_KEY', 'NASA_FIRMS_API_KEY',
   'OLLAMA_API_URL', 'OLLAMA_MODEL', 'WORLDMONITOR_API_KEY', 'WTO_API_KEY',
-  'AVIATIONSTACK_API', 'ICAO_API_KEY', 'UCDP_ACCESS_TOKEN', DESKTOP_AUTH_SECRET_ENV,
+  'AVIATIONSTACK_API', 'ICAO_API_KEY', 'UCDP_ACCESS_TOKEN',
 ]);
 
 const CHROME_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const RSS_PROXY_SECURITY_HEADERS = Object.freeze({
+  // RSS publishers are untrusted. The response must not become a same-origin
+  // document if a caller navigates to or frames the proxy URL.
+  'content-security-policy': "sandbox; default-src 'none'; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'",
+  'x-content-type-options': 'nosniff',
+});
 
 // ── SSRF protection ──────────────────────────────────────────────────────
 // Block requests to private/reserved IP ranges to prevent the RSS proxy
@@ -302,10 +423,63 @@ const BLOCKED_IPV4_RANGES = [
   return [baseInt, mask];
 });
 
+// Expand a valid IPv6 literal (any spelling, brackets optional) into its eight
+// 16-bit groups. WHATWG URL parsing canonicalizes first, so an embedded dotted
+// quad and a `::` run both come back as plain hextets.
+function ipv6Hextets(ip) {
+  const normalized = String(ip).replace(/^\[|\]$/g, '');
+  if (isIP(normalized) !== 6) return null;
+
+  let canonical;
+  try {
+    canonical = new URL(`http://[${normalized}]/`).hostname.slice(1, -1);
+  } catch {
+    return null;
+  }
+
+  const [head, tail = ''] = canonical.split('::');
+  const headGroups = head ? head.split(':') : [];
+  const tailGroups = tail ? tail.split(':') : [];
+  const fill = canonical.includes('::') ? 8 - headGroups.length - tailGroups.length : 0;
+  if (fill < 0 || headGroups.length + tailGroups.length + fill !== 8) return null;
+  const groups = [...headGroups, ...Array(fill).fill('0'), ...tailGroups]
+    .map((group) => Number.parseInt(group, 16));
+  return groups.some((group) => !Number.isInteger(group) || group < 0 || group > 0xffff) ? null : groups;
+}
+
+// IPv6 forms that carry an IPv4 address and are routed by a translator or a
+// tunnel: block them by the embedded IPv4, not the IPv6 prefix. Mirrors
+// api/_notification-webhook-ssrf.ts embeddedIpv4FromIpv6.
+function ipv4EmbeddedInIPv6(ip) {
+  const groups = ipv6Hextets(ip);
+  if (!groups) return null;
+  const [g0, g1, g2, g3, g4, g5, g6, g7] = groups;
+  const dotted = (hi, lo) => [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join('.');
+  const zeroPrefix = g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0;
+
+  if (zeroPrefix && g5 === 0xffff) return dotted(g6, g7);                        // ::ffff:0:0/96 IPv4-mapped
+  if (g0 === 0x0064 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
+    return dotted(g6, g7);                                                        // 64:ff9b::/96 NAT64
+  }
+  if (g0 === 0x2002) return dotted(g1, g2);                                       // 2002::/16 6to4
+  if (zeroPrefix && g5 === 0) return dotted(g6, g7);                              // ::/96 IPv4-compatible
+  return null;
+}
+
+// Teredo (2001::/32) tunnels to an arbitrary IPv4 chosen by the client, so no
+// embedded-address rule can vet it; the whole 2001::/32 block is reserved.
+function isTeredoIPv6(ip) {
+  const groups = ipv6Hextets(ip);
+  return !!groups && groups[0] === 0x2001 && groups[1] === 0;
+}
+
 function isPrivateIP(ip) {
-  // IPv4-mapped IPv6 — extract the v4 portion
-  const v4Mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
-  const addr = v4Mapped ? v4Mapped[1] : ip;
+  // IPv6 literals that embed an IPv4 (mapped, NAT64, 6to4, compatible) are
+  // judged by that IPv4. WHATWG URL parsing canonicalizes mapped literals to
+  // hexadecimal (::ffff:127.0.0.1 -> ::ffff:7f00:1), so every valid spelling
+  // is normalized before the v4 portion is extracted.
+  if (isTeredoIPv6(ip)) return true;
+  const addr = ipv4EmbeddedInIPv6(ip) || ip;
 
   // IPv6 loopback
   if (addr === '::1' || addr === '::') return true;
@@ -395,8 +569,36 @@ function json(data, status = 200, extraHeaders = {}) {
   });
 }
 
+function rssProxyJson(data, status = 200) {
+  return json(data, status, RSS_PROXY_SECURITY_HEADERS);
+}
+
+function rssProxyResponse(body, status = 200) {
+  return new Response(body, {
+    status,
+    headers: {
+      ...RSS_PROXY_SECURITY_HEADERS,
+      'content-type': 'application/xml; charset=utf-8',
+    },
+  });
+}
+
 function canCompress(headers, body) {
-  return body.length > 1024 && !headers['content-encoding'];
+  if (!(body.length > 1024) || headers['content-encoding']) return false;
+  const contentType = String(headers['content-type'] || '').toLowerCase();
+  // Already-compressed rasters/media gain nothing from gzip/br and waste CPU (#7382).
+  // SVG (image/svg+xml) is text and still compresses — keep it eligible.
+  if (
+    /^image\/(jpeg|jpg|png|gif|webp|avif|heic|heif|bmp|tiff)(?:;|$)/.test(contentType)
+    || contentType.startsWith('audio/')
+    || contentType.startsWith('video/')
+    || contentType.includes('zip')
+    || contentType.includes('gzip')
+    || contentType.includes('octet-stream')
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function appendVary(existing, token) {
@@ -520,6 +722,8 @@ async function buildRouteTable(root) {
 }
 
 const REQUEST_BODY_CACHE = Symbol('requestBodyCache');
+// Leave time for local fallback within the frontend's 5s request budgets.
+const CLOUD_PROXY_TIMEOUT_MS = 3000;
 
 async function readBody(req) {
   if (Object.prototype.hasOwnProperty.call(req, REQUEST_BODY_CACHE)) {
@@ -551,12 +755,104 @@ function toHeaders(nodeHeaders, options = {}) {
   return headers;
 }
 
-async function proxyToCloud(requestUrl, req, remoteBase) {
-  const target = `${remoteBase}${requestUrl.pathname}${requestUrl.search}`;
+// The renderer forwards a signed-in Pro user's Clerk bearer under its own
+// header: `Authorization` on the renderer → sidecar hop carries the sidecar
+// token, so the user credential cannot share it (#9396).
+const CLOUD_USER_AUTHORIZATION_HEADER = 'x-worldmonitor-user-authorization';
+const CLOUD_BEARER_SHAPE = /^Bearer [A-Za-z0-9._~+/-]+=*$/;
+const CLOUD_SESSION_REFRESH_MARGIN_MS = 5 * 60 * 1000;
+const CLOUD_SESSION_RETRY_MS = 30 * 1000;
+
+// The cloud edge 403s missing, short, and library user agents. The renderer's
+// hop arrives through Rust with none, and a WebView UA would misreport the caller.
+function cloudUserAgent() {
+  return `WorldMonitor-Desktop/${process.env.LOCAL_API_APP_VERSION || 'unknown'} (sidecar)`;
+}
+
+function cloudUrl(remoteBase, pathname) {
+  const target = new URL(remoteBase);
+  target.pathname = `${target.pathname.replace(/\/$/, '')}${pathname}`;
+  return target;
+}
+
+// The gateway authenticates a Pro browser by an anonymous wms_ session plus
+// the Clerk bearer; the bearer alone is ignored on routes that are not
+// tier-gated. Mint the session the way a browser does and reuse it until
+// close to expiry. A failed mint is retried after a pause, not per request.
+async function mintCloudSession(remoteBase) {
+  try {
+    const response = await fetch(cloudUrl(remoteBase, '/api/wm-session'), {
+      method: 'POST',
+      headers: { Origin: 'https://worldmonitor.app', 'User-Agent': cloudUserAgent() },
+      signal: AbortSignal.timeout(CLOUD_PROXY_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    if (typeof payload?.token !== 'string' || !payload.token.startsWith('wms_') || !Number.isFinite(payload.exp)) {
+      return null;
+    }
+    return { token: payload.token, exp: payload.exp };
+  } catch {
+    return null;
+  }
+}
+
+// A failed refresh keeps the current session until it actually expires.
+async function getCloudSessionToken(context) {
+  const now = Date.now();
+  const cached = context.cloudSession;
+  const usable = cached?.token && cached.exp > now ? cached.token : null;
+  if (usable && cached.exp - now > CLOUD_SESSION_REFRESH_MARGIN_MS) return usable;
+  if (cached?.retryAt > now) return usable;
+  context.cloudSessionMint ??= mintCloudSession(context.remoteBase).then((session) => {
+    context.cloudSession = session ?? { ...cached, token: usable, retryAt: Date.now() + CLOUD_SESSION_RETRY_MS };
+    return session?.token ?? usable;
+  }).finally(() => {
+    context.cloudSessionMint = null;
+  });
+  return context.cloudSessionMint;
+}
+
+// Cookies api/wm-session.js issues and reads.
+const CLOUD_SESSION_COOKIES = new Set(['wm-session', '__Host-wm-widget-key', '__Host-wm-pro-key']);
+
+function pickCloudSessionCookies(raw) {
+  if (!raw) return '';
+  return raw.split(';').map((part) => part.trim()).filter((part) => {
+    const eq = part.indexOf('=');
+    return eq > 0 && CLOUD_SESSION_COOKIES.has(part.slice(0, eq).trim());
+  }).join('; ');
+}
+
+// `relayKey` (self-host relay, KTD7): send exactly this key and no other
+// credential. `signal` replaces the default 3s deadline; `streamResponse`
+// resolves at headers with a streaming body.
+async function proxyToCloud(requestUrl, req, context, { relayKey = null, signal = null, streamResponse = false } = {}) {
+  // One budget covers session minting and the fetch, so a cold session cannot
+  // stretch a request past the renderer's fallback timeout.
+  const deadline = signal ?? AbortSignal.timeout(CLOUD_PROXY_TIMEOUT_MS);
+  const target = cloudUrl(context.remoteBase, requestUrl.pathname);
+  target.search = requestUrl.search;
   const body = ['GET', 'HEAD'].includes(req.method) ? undefined : await readBody(req);
   const headers = toHeaders(req.headers, { stripOrigin: true });
+  headers.delete(LOCAL_API_TRANSPORT_HEADER);
   // Strip sidecar auth token — meaningless to cloud API.
   headers.delete('Authorization');
+  // A relay sends the key and nothing else. Ordinary cloud fallback forwards
+  // only the cloud's own session cookies, never an operator's proxy cookies
+  // (dispatch() already removed the desktop-key cookie).
+  const cloudCookies = relayKey ? '' : pickCloudSessionCookies(headers.get('Cookie'));
+  if (cloudCookies) headers.set('Cookie', cloudCookies);
+  else headers.delete('Cookie');
+  const userAuthorization = headers.get(CLOUD_USER_AUTHORIZATION_HEADER) ?? '';
+  headers.delete(CLOUD_USER_AUTHORIZATION_HEADER);
+  const userBearer = !relayKey && CLOUD_BEARER_SHAPE.test(userAuthorization) ? userAuthorization : '';
+  headers.set('User-Agent', relayKey ? selfHostRelayUserAgent() : cloudUserAgent());
+  if (relayKey) {
+    // A browser-set header must not outrank the key the user stored.
+    headers.delete('X-Api-Key');
+    headers.set('X-WorldMonitor-Key', relayKey);
+  }
   // Strip conditional headers so cloud always returns fresh 200, not 304.
   // The browser may have stale ETags from previous sessions with empty data.
   headers.delete('If-None-Match');
@@ -573,11 +869,36 @@ async function proxyToCloud(requestUrl, req, remoteBase) {
     const wmKey = process.env.WORLDMONITOR_API_KEY;
     if (wmKey) headers.set('X-WorldMonitor-Key', wmKey);
   }
-  return fetch(target, {
-    method: req.method,
-    headers,
-    body,
-  });
+  // Only a signed-in Pro desktop forwards a bearer.
+  if (userBearer) headers.set('Authorization', userBearer);
+  // Without a key the gateway answers 401, so every desktop presents the
+  // anonymous session a browser holds (#7548). The gateway rejects that session
+  // on tier-gated routes, so it unlocks nothing beyond the public web app.
+  if (!headers.has('X-WorldMonitor-Key')) {
+    const session = await Promise.race([
+      getCloudSessionToken(context),
+      new Promise((resolve) => {
+        if (deadline.aborted) resolve(null);
+        else deadline.addEventListener('abort', () => resolve(null), { once: true });
+      }),
+    ]);
+    if (session) headers.set('X-WorldMonitor-Key', session);
+  }
+  const clientAbort = new AbortController();
+  const onClientClose = () => clientAbort.abort();
+  req.socket.once('close', onClientClose);
+  if (req.socket.destroyed) clientAbort.abort();
+  try {
+    return await fetch(target, {
+      method: req.method,
+      headers,
+      body,
+      signal: AbortSignal.any([clientAbort.signal, deadline]),
+      ...(streamResponse ? { [STREAM_RESPONSE_FETCH]: true } : {}),
+    });
+  } finally {
+    req.socket.off('close', onClientClose);
+  }
 }
 
 async function proxyRegisterInterestToCloud(requestUrl, req, context) {
@@ -598,6 +919,8 @@ async function proxyRegisterInterestToCloud(requestUrl, req, context) {
   };
   const body = JSON.stringify(normalizedPayload);
   const headers = toHeaders(req.headers, { stripOrigin: true });
+  headers.delete(LOCAL_API_TRANSPORT_HEADER);
+  headers.delete(CLOUD_USER_AUTHORIZATION_HEADER);
   headers.delete('Authorization');
   headers.delete('If-None-Match');
   headers.delete('If-Modified-Since');
@@ -605,25 +928,325 @@ async function proxyRegisterInterestToCloud(requestUrl, req, context) {
   headers.delete('Content-Encoding');
   headers.delete('Connection');
   headers.delete('Expect');
-  headers.delete(DESKTOP_AUTH_TIMESTAMP_HEADER);
-  headers.delete(DESKTOP_AUTH_SIGNATURE_HEADER);
   headers.set('Origin', 'https://worldmonitor.app');
   headers.set('User-Agent', CHROME_UA);
   headers.set('Content-Type', 'application/json');
   headers.set('Content-Length', String(Buffer.byteLength(body)));
-
-  const secret = process.env[DESKTOP_AUTH_SECRET_ENV];
-  if (secret) {
-    const timestamp = String(Date.now());
-    headers.set(DESKTOP_AUTH_TIMESTAMP_HEADER, timestamp);
-    headers.set(DESKTOP_AUTH_SIGNATURE_HEADER, signDesktopAuthPayload(secret, timestamp, normalizedPayload));
-  }
 
   return fetchWithTimeout(target, {
     method: 'POST',
     headers: Object.fromEntries(headers.entries()),
     body,
   }, 15000);
+}
+
+// ── Self-host desktop-key relay (plan 2026-11-04-001, U3/U4) ─────────────
+// In docker mode a browser user can store their own desktop key in an
+// HttpOnly cookie through /api/selfhost-key. Premium paths then go to the
+// cloud with that key, metered on the owner's desktop allocation. The cookie
+// is removed from the request at dispatch entry, so only the relay decision
+// and /api/selfhost-key ever read it. The raw key is never logged.
+const SELFHOST_KEY_COOKIE = 'wm-desktop-key';
+const SELFHOST_KEY_SHAPE = /^wm_[a-f0-9]{40}$/;
+const SELFHOST_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
+const SELFHOST_VERDICTS = new Set(['active', 'invalid', 'not_desktop_key', 'over_cap', 'lapsed']);
+// Verdicts whose key the browser keeps: the account exists and can recover.
+const SELFHOST_COOKIE_VERDICTS = new Set(['active', 'over_cap', 'lapsed']);
+// Verdicts that can never turn active again: the stored key is forgotten.
+const SELFHOST_FORGET_VERDICTS = new Set(['invalid', 'not_desktop_key']);
+const SELFHOST_VERDICT_CACHE_MAX = 1000;
+const SELFHOST_VERDICT_TIMEOUT_MS = 5000;
+const SELFHOST_POST_LIMIT = 10;
+const SELFHOST_POST_WINDOW_MS = 60_000;
+const SELFHOST_MAX_BODY_BYTES = 4096;
+const DEFAULT_SELFHOST_VERDICT_TTL_MS = 5 * 60 * 1000;
+// Time to response headers only; a streamed body is not bounded by it. Vercel
+// edge functions must start answering within 25s, so 30s covers every premium
+// route's first byte without letting a dead cloud hold the panel forever.
+const DEFAULT_SELFHOST_RELAY_TIMEOUT_MS = 30_000;
+let selfHostVerdictTtlMs = DEFAULT_SELFHOST_VERDICT_TTL_MS;
+let selfHostRelayTimeoutMs = DEFAULT_SELFHOST_RELAY_TIMEOUT_MS;
+// Relayed responses bypass the buffering response writer (SSE must stream).
+const streamedResponses = new WeakSet();
+// The cloud's cookies and host-wide policies (HSTS, Alt-Svc) are for its own
+// origin, not the self-hosted one.
+const RELAY_DROPPED_RESPONSE_HEADERS = [
+  'connection', 'keep-alive', 'transfer-encoding', 'set-cookie', 'strict-transport-security', 'alt-svc',
+];
+
+function selfHostRelayUserAgent() {
+  return `WorldMonitor-SelfHost/${process.env.LOCAL_API_APP_VERSION || 'unknown'} (relay)`;
+}
+
+function hashSelfHostKey(key) {
+  return createHash('sha256').update(key).digest('hex');
+}
+
+// Removes every wm-desktop-key cookie from the incoming request, so no handler
+// or proxied call downstream can read it, and returns the value. Two different
+// values (a cookie tossed in from a sibling host beside ours) return '', which
+// is never relayed: the browser's own key cannot be told apart from the other.
+function takeSelfHostKeyCookie(req) {
+  const raw = req.headers.cookie;
+  if (typeof raw !== 'string' || !raw.includes(SELFHOST_KEY_COOKIE)) return null;
+  let key = null;
+  const kept = [];
+  for (const part of raw.split(';')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf('=');
+    const name = eq === -1 ? trimmed : trimmed.slice(0, eq).trim();
+    if (name === SELFHOST_KEY_COOKIE) {
+      const value = eq === -1 ? '' : trimmed.slice(eq + 1).trim();
+      key = key === null || key === value ? value : '';
+    } else {
+      kept.push(trimmed);
+    }
+  }
+  if (kept.length) req.headers.cookie = kept.join('; ');
+  else delete req.headers.cookie;
+  return key;
+}
+
+// The cloud verdict contract (api/desktop-key/status.ts): only a 200 whose
+// JSON `verdict` is a known value is a verdict. A 403 edge refusal, 404 (a
+// cloud without the route), 429, 5xx or a non-JSON answer is "unavailable".
+function parseDesktopKeyVerdict(status, bodyText) {
+  if (status !== 200) return 'unavailable';
+  try {
+    const verdict = JSON.parse(bodyText)?.verdict;
+    return SELFHOST_VERDICTS.has(verdict) ? verdict : 'unavailable';
+  } catch {
+    return 'unavailable';
+  }
+}
+
+async function fetchDesktopKeyVerdict(key, context) {
+  try {
+    const response = await fetch(cloudUrl(context.remoteBase, '/api/desktop-key/status'), {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Origin: 'https://worldmonitor.app',
+        'User-Agent': selfHostRelayUserAgent(),
+        'X-WorldMonitor-Key': key,
+      },
+      signal: AbortSignal.timeout(SELFHOST_VERDICT_TIMEOUT_MS),
+    });
+    return parseDesktopKeyVerdict(response.status, await response.text());
+  } catch {
+    return 'unavailable';
+  }
+}
+
+function freshSelfHostVerdict(context, hash) {
+  const entry = context.selfHostVerdicts.get(hash);
+  return entry && !entry.recheck && Date.now() - entry.verifiedAt < selfHostVerdictTtlMs ? entry : null;
+}
+
+// Cached for the TTL, including invalid verdicts. A failed check keeps the
+// last entry so it can be served stale with its original verification time.
+async function resolveSelfHostVerdict(key, context) {
+  const hash = hashSelfHostKey(key);
+  const fresh = freshSelfHostVerdict(context, hash);
+  if (fresh) return { status: fresh.status, stale: false, verifiedAt: fresh.verifiedAt };
+  let pending = context.selfHostVerdictChecks.get(hash);
+  if (!pending) {
+    pending = fetchDesktopKeyVerdict(key, context).then((status) => {
+      if (status !== 'unavailable') {
+        const verdicts = context.selfHostVerdicts;
+        verdicts.delete(hash);
+        verdicts.set(hash, { status, verifiedAt: Date.now() });
+        if (verdicts.size > SELFHOST_VERDICT_CACHE_MAX) verdicts.delete(verdicts.keys().next().value);
+      }
+      context.logger.log(`[local-api] desktop key ${hash.slice(0, 8)} verdict: ${status}`);
+      return status;
+    }).finally(() => context.selfHostVerdictChecks.delete(hash));
+    context.selfHostVerdictChecks.set(hash, pending);
+  }
+  const status = await pending;
+  if (status !== 'unavailable') {
+    const entry = context.selfHostVerdicts.get(hash);
+    return { status, stale: false, verifiedAt: entry?.verifiedAt ?? Date.now() };
+  }
+  const last = context.selfHostVerdicts.get(hash);
+  if (last) return { status: last.status, stale: true, verifiedAt: last.verifiedAt };
+  return { status: 'unavailable', stale: false, verifiedAt: null };
+}
+
+// Relay only while the key is not known to be inactive, so a locked browser
+// does not spray denials at the cloud (KTD6). The last verdict counts even when
+// stale: a lapsed key keeps getting free local data until a status check (the
+// browser polls) finds it active again.
+function shouldRelayForSelfHostKey(key, context) {
+  if (!SELFHOST_KEY_SHAPE.test(key)) return false;
+  const last = context.selfHostVerdicts.get(hashSelfHostKey(key));
+  return !last || last.status === 'active';
+}
+
+// SameSite=Strict still sends the cookie from a sibling host or another port on
+// the same site, so a page there could spend the owner's allowance. Only this
+// origin's own pages (or a typed-in navigation) may relay.
+//
+// Browsers send Fetch Metadata only to HTTPS and localhost. Over plain HTTP
+// the request must instead carry a Referer from this install's own origin: a
+// sibling page can suppress its Referer but cannot forge ours. nginx passes
+// the browser's Host as X-Forwarded-Host; reached directly, Host is the origin.
+function selfHostRelayFetchSiteAllowed(req) {
+  const fetchSite = req.headers['sec-fetch-site'];
+  if (fetchSite !== undefined) return fetchSite === 'same-origin' || fetchSite === 'none';
+  // Behind a proxy only X-Forwarded-Host is trustworthy: a proxy's `Host $host`
+  // drops the port, so a page on the host's default port would match.
+  const proxied = req.headers['x-forwarded-for'] !== undefined || req.headers['x-real-ip'] !== undefined;
+  const authority = req.headers['x-forwarded-host'] || (proxied ? '' : req.headers.host);
+  const publicHost = String(authority || '').split(',')[0].trim().toLowerCase();
+  if (!publicHost) return false;
+  try {
+    return new URL(String(req.headers.referer || '')).host.toLowerCase() === publicHost;
+  } catch {
+    return false;
+  }
+}
+
+function selfHostKeyCookieHeader(req, context, value, maxAgeSeconds) {
+  // The bundled nginx stamps its own (http) scheme even behind an outer TLS
+  // proxy, so the browser's page origin also counts. Trusting it only ever
+  // adds Secure.
+  const forwardedHttps = String(req.headers['x-forwarded-proto'] || '')
+    .split(',').some((hop) => hop.trim().toLowerCase() === 'https');
+  const pageHttps = [req.headers.origin, req.headers.referer]
+    .some((value) => String(value || '').trim().toLowerCase().startsWith('https://'));
+  const secure = context.publicHttps || forwardedHttps || pageHttps;
+  return `${SELFHOST_KEY_COOKIE}=${value}; Path=/api/; Max-Age=${maxAgeSeconds}; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}`;
+}
+
+function selfHostKeyJson(body, status = 200, extraHeaders = {}) {
+  return json(body, status, { 'Cache-Control': 'no-store', ...extraHeaders });
+}
+
+function selfHostClientAllowed(req, context) {
+  const client = String(req.headers['x-real-ip'] || req.socket.remoteAddress || 'unknown');
+  const now = Date.now();
+  const limits = context.selfHostPostLimits;
+  if (limits.size > SELFHOST_VERDICT_CACHE_MAX) {
+    for (const [ip, window] of limits) if (window.resetAt <= now) limits.delete(ip);
+  }
+  let window = limits.get(client);
+  if (!window || window.resetAt <= now) {
+    window = { count: 0, resetAt: now + SELFHOST_POST_WINDOW_MS };
+    limits.set(client, window);
+  }
+  window.count += 1;
+  if (window.count <= SELFHOST_POST_LIMIT) return { ok: true };
+  return { ok: false, retryAfterSeconds: Math.max(1, Math.ceil((window.resetAt - now) / 1000)) };
+}
+
+// GET reports the browser's key status; POST stores a key the cloud vouches
+// for; DELETE forgets it. Every answer is { enabled, status, stale, verifiedAt }.
+async function handleSelfHostKey(req, context, cookieKey) {
+  const answer = (status, extra = {}) => ({
+    enabled: true, status, stale: false, verifiedAt: null, ...extra,
+  });
+  if (!['GET', 'POST', 'DELETE'].includes(req.method)) {
+    return selfHostKeyJson({ error: 'Method not allowed' }, 405, { Allow: 'GET, POST, DELETE' });
+  }
+  if (req.method !== 'GET') {
+    const contentType = String(req.headers['content-type'] || '');
+    if (!/^application\/json\s*(;|$)/i.test(contentType)) {
+      return selfHostKeyJson({ error: 'Content-Type must be application/json' }, 415);
+    }
+    // nginx rewrites Origin, so fetch metadata is the cross-site signal.
+    const fetchSite = req.headers['sec-fetch-site'];
+    if (fetchSite !== undefined && fetchSite !== 'same-origin') {
+      return selfHostKeyJson({ error: 'Cross-site request refused' }, 403);
+    }
+  }
+  if (req.method === 'DELETE') {
+    const clear = selfHostKeyCookieHeader(req, context, '', 0);
+    const body = context.selfHostRelay
+      ? answer('none')
+      : { enabled: false, status: 'disabled', stale: false, verifiedAt: null };
+    return selfHostKeyJson(body, 200, { 'Set-Cookie': clear });
+  }
+  if (!context.selfHostRelay) {
+    return selfHostKeyJson({ enabled: false, status: 'disabled', stale: false, verifiedAt: null });
+  }
+  if (req.method === 'GET') {
+    if (cookieKey === null) return selfHostKeyJson(answer('none'));
+    if (!SELFHOST_KEY_SHAPE.test(cookieKey)) return selfHostKeyJson(answer('invalid'));
+    if (!freshSelfHostVerdict(context, hashSelfHostKey(cookieKey))) {
+      const allowed = selfHostClientAllowed(req, context);
+      if (!allowed.ok) {
+        return selfHostKeyJson({ error: 'Too many key checks' }, 429, { 'Retry-After': String(allowed.retryAfterSeconds) });
+      }
+    }
+    // GET only reports, and never sets or clears the cookie: a slow check for an
+    // old key can finish after a POST stored a new one, and a clearing
+    // Set-Cookie on it would delete the new key. A dead key is not relayed
+    // anyway (shouldRelayForSelfHostKey uses the last verdict).
+    return selfHostKeyJson({ enabled: true, ...(await resolveSelfHostVerdict(cookieKey, context)) });
+  }
+  const allowed = selfHostClientAllowed(req, context);
+  if (!allowed.ok) {
+    return selfHostKeyJson({ error: 'Too many key checks' }, 429, { 'Retry-After': String(allowed.retryAfterSeconds) });
+  }
+  const raw = await readBody(req);
+  let key = null;
+  if (raw && raw.length <= SELFHOST_MAX_BODY_BYTES) {
+    try {
+      const parsed = JSON.parse(raw.toString('utf8'));
+      if (typeof parsed?.key === 'string') key = parsed.key.trim();
+    } catch { /* malformed JSON is a malformed key */ }
+  }
+  // A rejected key also clears any key stored earlier. The browser locks on the
+  // rejection, so leaving the old cookie would let the next GET unlock again.
+  const clearStored = { 'Set-Cookie': selfHostKeyCookieHeader(req, context, '', 0) };
+  if (!key || !SELFHOST_KEY_SHAPE.test(key)) {
+    return selfHostKeyJson(answer('invalid', { error: 'malformed_key' }), 400, clearStored);
+  }
+  const verdict = await resolveSelfHostVerdict(key, context);
+  // A stale verdict is an outage answer: storing or clearing on it would let
+  // the cookie and the browser's state disagree, so report it as unavailable.
+  if (verdict.stale) return selfHostKeyJson(answer('unavailable'));
+  const body = { enabled: true, ...verdict };
+  if (SELFHOST_COOKIE_VERDICTS.has(verdict.status)) {
+    return selfHostKeyJson(body, 200, {
+      'Set-Cookie': selfHostKeyCookieHeader(req, context, key, SELFHOST_COOKIE_MAX_AGE_SECONDS),
+    });
+  }
+  if (SELFHOST_FORGET_VERDICTS.has(verdict.status)) {
+    return selfHostKeyJson(body, 200, clearStored);
+  }
+  return selfHostKeyJson(body);
+}
+
+async function relayToCloudWithSelfHostKey(requestUrl, req, context, key) {
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), selfHostRelayTimeoutMs);
+  let response;
+  try {
+    response = await proxyToCloud(requestUrl, req, context, {
+      relayKey: key, signal: deadline.signal, streamResponse: true,
+    });
+  } catch (error) {
+    // A relay failure is not a denial: the client keeps its unlock state (KTD5).
+    const timedOut = deadline.signal.aborted;
+    logOnce(context.logger, requestUrl.pathname, `self-host relay ${timedOut ? 'timed out' : `failed: ${error?.message || 'error'}`}`);
+    return json(
+      { error: timedOut ? 'relay_timeout' : 'relay_unreachable' },
+      timedOut ? 504 : 502,
+      { 'Cache-Control': 'no-store', 'X-Wm-Relay-Error': timedOut ? 'timeout' : 'unreachable' },
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+  if (response.status === 401 || response.status === 403) {
+    // The browser re-checks on a denial; make that check ask the cloud.
+    const entry = context.selfHostVerdicts.get(hashSelfHostKey(key));
+    if (entry) entry.recheck = true;
+  }
+  streamedResponses.add(response);
+  return response;
 }
 
 function pickModule(pathname, routes) {
@@ -646,6 +1269,11 @@ const cloudPreferred = new Set();
 // Routes/prefixes that should always proxy to cloud. The sidecar lacks
 // WS_RELAY_URL (Yahoo/Finnhub relay) and seeded Redis data. These routes
 // return 200-with-empty-data locally, so normal cloudFallback won't trigger.
+//
+// `/api/market/v1/` covers ListMarketQuotes, so the desktop app gets the same
+// seed-first contract as the web dashboard — including custom watchlist
+// symbols resolved through the cloud provider adapter (#6305). Serving it
+// locally would find no seed snapshot and report every symbol unavailable.
 const cloudPreferredPrefixes = !process.env.WS_RELAY_URL
   ? [
     '/api/market/v1/',
@@ -655,14 +1283,211 @@ const cloudPreferredPrefixes = !process.env.WS_RELAY_URL
     '/api/research/v1/',
   ]
   : [];
-const cloudPreferredExact = !process.env.WS_RELAY_URL
-  ? new Set(['/api/bootstrap'])
-  : new Set();
+// These routes read seed-owned Redis snapshots that the local sidecar does not
+// hold. They must stay cloud-preferred even when a desktop configures WS relay;
+// relay availability does not provide Upstash credentials to local handlers.
+// Seed-only RPC routes in families that also have live handlers (#5906); the
+// whole-family cases are in cloudPreferredSeedOnlyPrefixes below.
+// tests/sidecar-cloud-preferred-seed-only.test.mjs derives this set from the
+// generated route tables and fails when an entry is not a real RPC path, when
+// its handler reaches an upstream itself, or when a seed-only route is missing.
+const cloudPreferredExact = new Set([
+  '/api/maritime/v1/list-ukmto-incidents',
+  '/api/bootstrap',
+  '/api/aviation/v1/get-airport-ops-summary',
+  '/api/displacement/v1/get-displacement-summary',
+  '/api/displacement/v1/get-internal-displacement',
+  '/api/displacement/v1/get-cross-border-movements',
+  '/api/economic/v1/get-bis-credit',
+  '/api/economic/v1/get-bis-exchange-rates',
+  '/api/economic/v1/get-bis-policy-rates',
+  '/api/economic/v1/get-bls-series',
+  '/api/economic/v1/get-capital-flows',
+  '/api/economic/v1/get-china-macro-snapshot',
+  '/api/economic/v1/get-crude-inventories',
+  '/api/economic/v1/get-ecb-fx-rates',
+  '/api/economic/v1/get-economic-calendar',
+  '/api/economic/v1/get-economic-stress',
+  '/api/economic/v1/get-energy-capacity',
+  '/api/economic/v1/get-energy-crisis-policies',
+  '/api/economic/v1/get-energy-prices',
+  '/api/economic/v1/get-eu-fsi',
+  '/api/economic/v1/get-eu-gas-storage',
+  '/api/economic/v1/get-eu-yield-curve',
+  '/api/economic/v1/get-eurostat-country-data',
+  '/api/economic/v1/get-fao-food-price-index',
+  '/api/economic/v1/get-food-prices',
+  '/api/economic/v1/get-fred-series',
+  '/api/economic/v1/get-fred-series-batch',
+  '/api/economic/v1/get-government-yield-curve',
+  '/api/economic/v1/get-macro-signals',
+  '/api/economic/v1/get-nat-gas-storage',
+  '/api/economic/v1/get-national-debt',
+  '/api/economic/v1/get-no2-activity',
+  '/api/economic/v1/get-oil-inventories',
+  '/api/economic/v1/get-oil-stocks-analysis',
+  '/api/economic/v1/get-us-cpi-monthly',
+  '/api/economic/v1/get-us-interest-rates',
+  '/api/economic/v1/get-us-treasury-par-yield-curve',
+  '/api/economic/v1/get-world-cpi-monthly',
+  '/api/economic/v1/list-bigmac-prices',
+  '/api/economic/v1/list-fuel-prices',
+  '/api/economic/v1/list-global-tenders',
+  '/api/economic/v1/list-grocery-basket-prices',
+  '/api/forecast/v1/get-forecasts',
+  '/api/forecast/v1/get-simulation-outcome',
+  '/api/forecast/v1/get-simulation-package',
+  '/api/infrastructure/v1/get-bootstrap-data',
+  '/api/infrastructure/v1/get-temporal-baseline',
+  '/api/infrastructure/v1/list-internet-ddos-attacks',
+  '/api/infrastructure/v1/list-internet-outages',
+  '/api/infrastructure/v1/list-internet-traffic-anomalies',
+  '/api/infrastructure/v1/list-temporal-anomalies',
+  '/api/intelligence/v1/compute-energy-shock',
+  '/api/intelligence/v1/get-china-decision-signals',
+  '/api/intelligence/v1/get-country-energy-profile',
+  '/api/intelligence/v1/get-country-history',
+  '/api/intelligence/v1/get-country-port-activity',
+  '/api/intelligence/v1/get-country-risk',
+  '/api/intelligence/v1/get-gdelt-topic-timeline',
+  '/api/intelligence/v1/get-pizzint-status',
+  '/api/intelligence/v1/get-regional-brief',
+  '/api/intelligence/v1/get-regional-snapshot',
+  '/api/intelligence/v1/get-social-velocity',
+  '/api/intelligence/v1/list-cross-source-signals',
+  '/api/intelligence/v1/list-gps-interference',
+  '/api/intelligence/v1/list-market-implications',
+  '/api/intelligence/v1/list-material-events',
+  '/api/intelligence/v1/list-satellites',
+  '/api/intelligence/v1/list-security-advisories',
+  '/api/intelligence/v1/list-wsb-tickers',
+  '/api/market/v1/get-cot-positioning',
+  '/api/market/v1/get-fear-greed-index',
+  '/api/market/v1/get-gold-intelligence',
+  '/api/market/v1/get-hyperliquid-flow',
+  '/api/market/v1/get-market-breadth-history',
+  '/api/market/v1/get-physical-divergence-index',
+  '/api/market/v1/get-physical-premiums',
+  '/api/market/v1/get-sector-summary',
+  '/api/market/v1/list-ai-tokens',
+  '/api/market/v1/list-commodity-quotes',
+  '/api/market/v1/list-crypto-sectors',
+  '/api/market/v1/list-defi-tokens',
+  '/api/market/v1/list-earnings-calendar',
+  '/api/market/v1/list-etf-flows',
+  '/api/market/v1/list-gulf-quotes',
+  '/api/market/v1/list-other-tokens',
+  '/api/military/v1/get-defense-industrial-base',
+  '/api/military/v1/get-theater-posture',
+  '/api/military/v1/get-usni-fleet-report',
+  '/api/military/v1/list-defense-patents',
+  '/api/news/v1/list-news-pool',
+  '/api/news/v1/list-source-items',
+  '/api/news/v1/summarize-article-cache',
+  '/api/research/v1/list-arxiv-papers',
+  '/api/research/v1/list-hackernews-items',
+  '/api/research/v1/list-trending-repos',
+  '/api/resilience/v1/get-demographics-capability',
+  '/api/resilience/v1/get-food-stocks',
+  '/api/resilience/v1/get-runtime-manifest',
+  '/api/scenario/v1/get-scenario-status',
+  '/api/supply-chain/v1/get-bypass-options',
+  '/api/supply-chain/v1/get-chokepoint-dependencies',
+  '/api/supply-chain/v1/get-chokepoint-history',
+  '/api/supply-chain/v1/get-country-vulnerabilities',
+  '/api/supply-chain/v1/get-fuel-shortage-detail',
+  '/api/supply-chain/v1/get-mineral-production',
+  '/api/supply-chain/v1/get-multi-sector-cost-shock',
+  '/api/supply-chain/v1/get-pipeline-detail',
+  '/api/supply-chain/v1/get-shipping-rates',
+  '/api/supply-chain/v1/get-shipping-stress',
+  '/api/supply-chain/v1/get-storage-facility-detail',
+  '/api/supply-chain/v1/list-energy-disruptions',
+  '/api/supply-chain/v1/list-fuel-shortages',
+  '/api/supply-chain/v1/list-pipelines',
+  '/api/supply-chain/v1/list-storage-facilities',
+  '/api/supply-chain/v1/list-vulnerability-rankings',
+  '/api/trade/v1/get-customs-revenue',
+  '/api/trade/v1/get-tariff-trends',
+  '/api/trade/v1/get-trade-barriers',
+  '/api/trade/v1/get-trade-flows',
+  '/api/trade/v1/get-trade-restrictions',
+  '/api/trade/v1/list-comtrade-flows',
+  '/api/v2/shipping/route-intelligence',
+  '/api/webcam/v1/list-webcams',
+]);
+// Route families whose EVERY handler only reads seed-owned Redis (#5906). The
+// sidecar never holds Upstash credentials (UPSTASH_* is not in
+// ALLOWED_ENV_KEYS), a Redis miss degrades to an empty 200, and an empty 200
+// never trips the `!response.ok` cloud fallback — so served locally these
+// families render blank panels with no error anywhere. Always cloud,
+// WS_RELAY_URL or not. A family that gains a live handler moves to exact
+// entries; the contract test above enforces that.
+const cloudPreferredSeedOnlyPrefixes = [
+  '/api/climate/v1/',
+  '/api/conflict/v1/',
+  '/api/consumer-prices/v1/',
+  '/api/cyber/v1/',
+  '/api/health/v1/',
+  '/api/natural/v1/',
+  '/api/positive-events/v1/',
+  '/api/prediction/v1/',
+  '/api/radiation/v1/',
+  '/api/safety/v1/',
+  '/api/sanctions/v1/',
+  '/api/seismology/v1/',
+  '/api/thermal/v1/',
+  '/api/unrest/v1/',
+  '/api/wildfire/v1/',
+];
+const cloudPreferredAlwaysPrefixes = ['/api/scorecard/v1/'];
+// Plain api/*.js routes whose answer lives in cloud-only state: session signing
+// secrets, OAuth client records, operator Redis sets, cross-user aggregates and
+// the security-report sink. The sidecar holds none of it, so served locally
+// they answer 5xx or empty. Until #9906 they reached the cloud only by accident:
+// a static Upstash import kept them from loading on desktop at all.
+// reverse-geocode belongs here too: its shared Nominatim limiter fails closed
+// without Upstash (503 locally), and its geocode cache is the cloud's Redis.
+const cloudPreferredServerStateRoutes = new Set([
+  '/api/analytics-health',
+  '/api/notification-suppressions',
+  '/api/oauth/authorize',
+  '/api/oauth/register',
+  '/api/reverse-geocode',
+  '/api/security/report',
+  '/api/wm-session',
+]);
+
+// Versioned route families (api/v{N}/{domain}) the desktop deliberately never
+// bundles — scripts/build-sidecar-handlers.mjs refuses to build an undeclared
+// one, and its CLOUD_ONLY_ROUTE_FAMILIES must list exactly these (#5907).
+// Routed to the cloud on purpose, WS_RELAY_URL or not: route-intelligence reads
+// seed-owned Redis (empty 200 locally, so `!ok` fallback never fires) and the
+// webhook family is Pro-gated + server-persisted, so the gate lives upstream.
+// Before this list the family reached the cloud only via the 404 "handler
+// missing" fallback — undeclared, and invisible when cloudFallback is off.
+const cloudOnlyRouteFamilyPrefixes = ['/api/v2/shipping/'];
 
 function isCloudPreferred(pathname) {
   if (cloudPreferred.has(pathname)) return true;
   if (cloudPreferredExact.has(pathname)) return true;
-  return cloudPreferredPrefixes.some(p => pathname.startsWith(p));
+  if (cloudPreferredServerStateRoutes.has(pathname)) return true;
+  return cloudPreferredAlwaysPrefixes.some(p => pathname.startsWith(p))
+    || cloudPreferredSeedOnlyPrefixes.some(p => pathname.startsWith(p))
+    || cloudOnlyRouteFamilyPrefixes.some(p => pathname.startsWith(p))
+    || cloudPreferredPrefixes.some(p => pathname.startsWith(p));
+}
+
+async function isLocalOnlyRequest(req, pathname) {
+  if (req.method !== 'POST' || pathname !== '/api/news/v1/summarize-article') return false;
+  const body = await readBody(req);
+  if (!body?.length) return false;
+  try {
+    const parsed = JSON.parse(body.toString('utf8'));
+    return parsed?.provider === 'ollama' && parsed?.mode === 'translate';
+  } catch {
+    return false;
+  }
 }
 
 const TRAFFIC_LOG_MAX = 200;
@@ -746,6 +1571,11 @@ function resolveConfig(options = {}) {
   const mode = String(options.mode ?? process.env.LOCAL_API_MODE ?? 'desktop-sidecar');
   const requestedFallback = String(options.cloudFallback ?? process.env.LOCAL_API_CLOUD_FALLBACK ?? '') === 'true';
   const cloudFallback = mode === 'docker' ? false : requestedFallback;
+  // The relay is on by default in docker mode; an operator who forbids
+  // egress sets WORLDMONITOR_SELFHOST_RELAY=off (KTD8).
+  const relaySetting = String(options.selfHostRelay ?? process.env.WORLDMONITOR_SELFHOST_RELAY ?? '').trim().toLowerCase();
+  const selfHostRelay = mode === 'docker' && !['off', 'false', '0'].includes(relaySetting);
+  const publicHttps = String(options.publicHttps ?? process.env.WORLDMONITOR_PUBLIC_HTTPS ?? '').trim() === '1';
   // Programmatic dev/test escape hatch only; CLI/env startup keeps private remoteBase blocked.
   const allowPrivateRemoteBase = options.allowPrivateRemoteBase === true;
   // Programmatic-only test escape hatch for adding extra origins to the
@@ -757,7 +1587,7 @@ function resolveConfig(options = {}) {
     : [];
   const logger = options.logger ?? console;
   if (mode === 'docker' && requestedFallback) {
-    logger.warn('[local-api] Cloud fallback disabled in Docker mode (self-hosted instances must not proxy to api.worldmonitor.app)');
+    logger.warn("[local-api] Cloud fallback disabled in Docker mode (only requests carrying the browser user's own desktop key are relayed to api.worldmonitor.app)");
   }
   if (cloudFallback && !allowPrivateRemoteBase && remoteBaseLooksPrivate(remoteBase)) {
     logger.warn(
@@ -774,6 +1604,11 @@ function resolveConfig(options = {}) {
     apiDir,
     mode,
     cloudFallback,
+    selfHostRelay,
+    publicHttps,
+    selfHostVerdicts: new Map(),
+    selfHostVerdictChecks: new Map(),
+    selfHostPostLimits: new Map(),
     allowPrivateRemoteBase,
     allowPrivateFetchOrigins,
     logger,
@@ -813,7 +1648,7 @@ async function tryCloudFallback(requestUrl, req, context, reason) {
     }
   }
   try {
-    const resp = await proxyToCloud(requestUrl, req, context.remoteBase);
+    const resp = await proxyToCloud(requestUrl, req, context);
     if (!resp.ok) {
       context.logger.warn(`[local-api] cloud returned ${resp.status} for ${requestUrl.pathname}`);
     }
@@ -855,36 +1690,52 @@ function makeCorsHeaders(req) {
   return {
     'Access-Control-Allow-Origin': getSidecarCorsOrigin(req),
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-WorldMonitor-Desktop-Timestamp, X-WorldMonitor-Desktop-Signature',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin',
   };
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
-  // Use node:https with IPv4 forced — Node.js built-in fetch (undici) tries IPv6
-  // first and some servers (EIA, NASA FIRMS) have broken IPv6 causing ETIMEDOUT.
+  const deadline = AbortSignal.timeout(timeoutMs);
+  const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+  // Use node:https with IPv4 by default — Node.js built-in fetch (undici) tries
+  // IPv6 first and some servers (EIA, NASA FIRMS) have broken IPv6. Callers
+  // with a validated address can instead pin its detected family below.
   const u = new URL(url);
   const allowPrivateNetwork = options.allowPrivateNetwork === true;
   const fetchOptions = { ...options };
   delete fetchOptions.allowPrivateNetwork;
+  const resolvedAddress = fetchOptions.resolvedAddress;
+  const requestedFamily = fetchOptions.resolvedFamily;
+  delete fetchOptions.resolvedAddress;
+  delete fetchOptions.resolvedFamily;
+  const resolvedFamily = resolvedAddress ? isIP(resolvedAddress) : 0;
+  if (resolvedAddress && resolvedFamily === 0) {
+    throw new TypeError('resolvedAddress must be an IPv4 or IPv6 address');
+  }
+  if (requestedFamily != null && requestedFamily !== resolvedFamily) {
+    throw new TypeError('resolvedFamily must match resolvedAddress');
+  }
   if (u.protocol === 'https:') {
     return new Promise((resolve, reject) => {
       const reqOpts = {
+        signal,
         hostname: u.hostname,
         port: u.port || 443,
         path: u.pathname + u.search,
         method: fetchOptions.method || 'GET',
         headers: fetchOptions.headers || {},
-        family: 4,
+        family: resolvedFamily || 4,
       };
       // Pin to a pre-resolved IP to prevent TOCTOU DNS rebinding.
       // The hostname is kept for SNI / TLS certificate validation.
-      if (fetchOptions.resolvedAddress) {
-        reqOpts.lookup = makePinnedLookup(fetchOptions.resolvedAddress, 4);
+      if (resolvedAddress) {
+        reqOpts.lookup = makePinnedLookup(resolvedAddress, resolvedFamily);
       }
       const req = https.request(reqOpts, (res) => {
         const chunks = [];
+        res.on('error', reject);
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
           const body = Buffer.concat(chunks);
@@ -913,21 +1764,15 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
   // validated IP and set the Host header so virtual-host routing still works.
   let fetchUrl = url;
   const fetchHeaders = { ...(fetchOptions.headers || {}) };
-  if (fetchOptions.resolvedAddress && u.protocol === 'http:') {
+  if (resolvedAddress && u.protocol === 'http:') {
     const pinned = new URL(url);
     fetchHeaders['Host'] = pinned.host;
-    pinned.hostname = fetchOptions.resolvedAddress;
+    pinned.hostname = resolvedFamily === 6 ? `[${resolvedAddress}]` : resolvedAddress;
     fetchUrl = pinned.toString();
   }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const requestOptions = { ...fetchOptions, headers: fetchHeaders, signal: controller.signal };
-    if (allowPrivateNetwork) requestOptions[ALLOW_PRIVATE_NETWORK_FETCH] = true;
-    return await fetch(fetchUrl, requestOptions);
-  } finally {
-    clearTimeout(timer);
-  }
+  const requestOptions = { ...fetchOptions, headers: fetchHeaders, signal };
+  if (allowPrivateNetwork) requestOptions[ALLOW_PRIVATE_NETWORK_FETCH] = true;
+  return fetch(fetchUrl, requestOptions);
 }
 
 function relayToHttpUrl(rawUrl) {
@@ -973,17 +1818,6 @@ async function validateSecretAgainstProvider(key, rawValue, context = {}) {
 
   try {
     switch (key) {
-    case 'GROQ_API_KEY': {
-      const response = await fetchWithTimeout('https://api.groq.com/openai/v1/models', {
-        headers: { Authorization: `Bearer ${value}`, 'User-Agent': CHROME_UA },
-      });
-      const text = await response.text();
-      if (isCloudflareChallenge403(response, text)) return ok('Groq key stored (Cloudflare blocked verification)');
-      if (isAuthFailure(response.status, text)) return fail('Groq rejected this key');
-      if (!response.ok) return fail(`Groq probe failed (${response.status})`);
-      return ok('Groq key verified');
-    }
-
     case 'OPENROUTER_API_KEY': {
       const response = await fetchWithTimeout('https://openrouter.ai/api/v1/models', {
         headers: { Authorization: `Bearer ${value}`, 'User-Agent': CHROME_UA },
@@ -1266,9 +2100,6 @@ async function validateSecretAgainstProvider(key, rawValue, context = {}) {
     case 'ICAO_API_KEY':
       return ok('ICAO API key stored (verification requires NOTAM endpoint access)');
 
-    case DESKTOP_AUTH_SECRET_ENV:
-      return ok('Desktop shared secret stored');
-
     default:
       return ok('Key stored');
     }
@@ -1282,6 +2113,15 @@ async function validateSecretAgainstProvider(key, rawValue, context = {}) {
 }
 
 async function dispatch(requestUrl, req, routes, context) {
+  // Only the relay decision and /api/selfhost-key may read the desktop-key
+  // cookie; local handlers and every other cloud call must never see it.
+  const selfHostKey = takeSelfHostKeyCookie(req);
+
+  // Docker's public proxy supplies transport auth, not native administration authority.
+  if (context.mode === 'docker' && requestUrl.pathname.startsWith('/api/local-')) {
+    return json({ error: 'Native administration is unavailable in Docker mode' }, 403);
+  }
+
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: makeCorsHeaders(req) });
   }
@@ -1300,89 +2140,45 @@ async function dispatch(requestUrl, req, routes, context) {
     return handleLocalServiceStatus(context);
   }
 
-  // HLS proxy — exempt from auth because <video src="..."> cannot carry
-  // custom headers.  Proxies HLS manifests and segments from allowlisted CDN
-  // hosts, adding the required Referer header that browsers cannot set.
-  // Desktop-only (sidecar); web uses YouTube fallback.
-  if (requestUrl.pathname === '/api/hls-proxy') {
-    const ALLOWED_HLS_HOSTS = new Set(['cdn-ca2-na.lncnetworks.host']);
-    const upstreamRaw = requestUrl.searchParams.get('url');
-    if (!upstreamRaw) return new Response('Missing url param', { status: 400, headers: { 'content-type': 'text/plain', ...makeCorsHeaders(req) } });
-    let upstream;
-    try { upstream = new URL(upstreamRaw); } catch { return new Response('Invalid url', { status: 400, headers: { 'content-type': 'text/plain', ...makeCorsHeaders(req) } }); }
-    if (upstream.protocol !== 'https:' || !ALLOWED_HLS_HOSTS.has(upstream.hostname)) {
-      return new Response('Host not allowed', { status: 403, headers: { 'content-type': 'text/plain', ...makeCorsHeaders(req) } });
-    }
-    try {
-      const hlsResp = await new Promise((resolve, reject) => {
-        const reqOpts = {
-          hostname: upstream.hostname,
-          port: 443,
-          path: upstream.pathname + upstream.search,
-          method: 'GET',
-          headers: { 'Referer': 'https://livenewschat.eu/', 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
-          family: 4,
-        };
-        const r = https.request(reqOpts, (res) => {
-          const chunks = [];
-          res.on('data', c => chunks.push(c));
-          res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
-        });
-        r.on('error', reject);
-        r.setTimeout(10000, () => r.destroy(new Error('HLS upstream timeout')));
-        r.end();
-      });
-      if (hlsResp.status < 200 || hlsResp.status >= 300) {
-        return new Response(`Upstream ${hlsResp.status}`, { status: hlsResp.status, headers: { 'content-type': 'text/plain', ...makeCorsHeaders(req) } });
-      }
-      const ct = hlsResp.headers['content-type'] || '';
-      const isManifest = upstreamRaw.endsWith('.m3u8') || ct.includes('mpegurl') || ct.includes('x-mpegurl');
-      if (isManifest) {
-        const basePath = upstream.pathname.substring(0, upstream.pathname.lastIndexOf('/') + 1);
-        const baseOrigin = upstream.origin;
-        let manifest = hlsResp.body.toString('utf-8');
-        manifest = manifest.replace(/^(?!#)(\S+)/gm, (match) => {
-          const full = match.startsWith('http') ? match : `${baseOrigin}${basePath}${match}`;
-          return `/api/hls-proxy?url=${encodeURIComponent(full)}`;
-        });
-        manifest = manifest.replace(/URI="([^"]+)"/g, (_m, uri) => {
-          const full = uri.startsWith('http') ? uri : `${baseOrigin}${basePath}${uri}`;
-          return `URI="/api/hls-proxy?url=${encodeURIComponent(full)}"`;
-        });
-        return new Response(manifest, { status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache', ...makeCorsHeaders(req) } });
-      }
-      return new Response(hlsResp.body, { status: 200, headers: { 'content-type': ct || 'application/octet-stream', 'cache-control': 'no-cache', ...makeCorsHeaders(req) } });
-    } catch (e) {
-      context.logger.warn('[hls-proxy] error:', e.message);
-      return new Response('Proxy error', { status: 502, headers: { 'content-type': 'text/plain', ...makeCorsHeaders(req) } });
-    }
-  }
-
   // YouTube embed bridge — exempt from auth because iframe src cannot carry
   // Authorization headers.  Serves a minimal HTML page that loads the YouTube
   // IFrame Player API from a localhost origin (which YouTube accepts, unlike
   // tauri://localhost).  No sensitive data is exposed.
   if (requestUrl.pathname === '/api/youtube-embed') {
+    // Exactly one of videoId (that video) or channel (whatever the channel has live right now).
     const videoId = requestUrl.searchParams.get('videoId');
-    if (!videoId || !/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
+    const channel = requestUrl.searchParams.get('channel');
+    if ((videoId === null) === (channel === null)) {
+      return new Response('Pass exactly one of videoId or channel', { status: 400, headers: { 'content-type': 'text/plain' } });
+    }
+    if (videoId !== null && !/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
       return new Response('Invalid videoId', { status: 400, headers: { 'content-type': 'text/plain' } });
+    }
+    if (channel !== null && !/^UC[A-Za-z0-9_-]{22}$/.test(channel)) {
+      return new Response('Invalid channel', { status: 400, headers: { 'content-type': 'text/plain' } });
     }
     const autoplay = requestUrl.searchParams.get('autoplay') === '0' ? '0' : '1';
     const mute = requestUrl.searchParams.get('mute') === '0' ? '0' : '1';
+    // The caller's presentation decides the chrome; a tile that draws its own asks for none.
+    const controls = requestUrl.searchParams.get('controls') === '0' ? '0' : '1';
     const vq = ['small','medium','large','hd720','hd1080'].includes(requestUrl.searchParams.get('vq') || '') ? requestUrl.searchParams.get('vq') : '';
     const origin = `http://localhost:${context.port}`;
     // parentOrigin is the actual parent window origin (tauri://localhost, asset://localhost, etc.)
-    // passed by the frontend so window.parent.postMessage reaches it. Only accept known desktop
-    // schemes; fall back to '*' if absent or unrecognised.
+    // passed by the frontend so bridge messages reach it. Only accept known desktop origins;
+    // an absent or unrecognized origin gets a local no-op bridge.
     const rawParentOrigin = requestUrl.searchParams.get('parentOrigin') || '';
     const isAllowedParentOrigin = /^(tauri|asset):\/\/localhost$/.test(rawParentOrigin)
       || /^https?:\/\/localhost(:\d{1,5})?$/.test(rawParentOrigin)
-      || /^https?:\/\/[\w-]+\.tauri\.localhost(:\d{1,5})?$/.test(rawParentOrigin);
-    const parentOrigin = isAllowedParentOrigin ? rawParentOrigin : '*';
-    const safeVideoId = JSON.stringify(String(videoId));
-    const safeOrigin = JSON.stringify(origin);
-    const safeParentOrigin = JSON.stringify(parentOrigin);
-    const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="strict-origin-when-cross-origin"><style>html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hidden}#player{width:100%;height:100%}#play-overlay{position:absolute;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;pointer-events:none;background:rgba(0,0,0,0.15)}#play-overlay svg{width:72px;height:72px;opacity:0.9;filter:drop-shadow(0 2px 8px rgba(0,0,0,0.5))}#play-overlay.hidden{display:none}</style></head><body><div id="player"></div><div id="play-overlay" class="hidden"><svg viewBox="0 0 68 48"><path d="M66.52 7.74c-.78-2.93-2.49-5.41-5.42-6.19C55.79.13 34 0 34 0S12.21.13 6.9 1.55C3.97 2.33 2.27 4.81 1.48 7.74.06 13.05 0 24 0 24s.06 10.95 1.48 16.26c.78 2.93 2.49 5.41 5.42 6.19C12.21 47.87 34 48 34 48s21.79-.13 27.1-1.55c2.93-.78 4.64-3.26 5.42-6.19C67.94 34.95 68 24 68 24s-.06-10.95-1.48-16.26z" fill="red"/><path d="M45 24L27 14v20" fill="#fff"/></svg></div><script>function tryStorageAccess(){if(document.requestStorageAccess){document.requestStorageAccess().catch(function(){})}}tryStorageAccess();var tag=document.createElement('script');tag.src='https://www.youtube.com/iframe_api';document.head.appendChild(tag);var player,overlay=document.getElementById('play-overlay'),started=false,muteSyncId,retryTimers=[];var obs=new MutationObserver(function(muts){for(var i=0;i<muts.length;i++){var nodes=muts[i].addedNodes;for(var j=0;j<nodes.length;j++){if(nodes[j].tagName==='IFRAME'){var a=nodes[j].getAttribute('allow')||'';if(a.indexOf('autoplay')===-1){nodes[j].setAttribute('allow','autoplay; encrypted-media; picture-in-picture; storage-access'+(a?'; '+a:''));console.log('[yt-embed] patched iframe allow=autoplay+storage-access')}obs.disconnect();return}}}});obs.observe(document.getElementById('player'),{childList:true,subtree:true});function hideOverlay(){overlay.classList.add('hidden')}function readMuted(){if(!player)return null;if(typeof player.isMuted==='function')return player.isMuted();if(typeof player.getVolume==='function')return player.getVolume()===0;return null}function stopMuteSync(){if(muteSyncId){clearInterval(muteSyncId);muteSyncId=null}}function startMuteSync(){if(muteSyncId)return;var last=readMuted();if(last!==null)window.parent.postMessage({type:'yt-mute-state',muted:last},${safeParentOrigin});muteSyncId=setInterval(function(){var m=readMuted();if(m!==null&&m!==last){last=m;window.parent.postMessage({type:'yt-mute-state',muted:m},${safeParentOrigin})}},500)}function tryAutoplay(){if(!player||!player.playVideo)return;try{player.mute();player.playVideo();console.log('[yt-embed] tryAutoplay: mute+play')}catch(e){}}function onYouTubeIframeAPIReady(){player=new YT.Player('player',{videoId:${safeVideoId},host:'https://www.youtube.com',playerVars:{autoplay:${autoplay},mute:${mute},playsinline:1,rel:0,controls:1,modestbranding:1,enablejsapi:1,origin:${safeOrigin},widget_referrer:${safeOrigin}},events:{onReady:function(){console.log('[yt-embed] onReady');window.parent.postMessage({type:'yt-ready'},${safeParentOrigin});${vq ? `if(player.setPlaybackQuality)player.setPlaybackQuality(${JSON.stringify(vq)});` : ''}if(${autoplay}===1){tryAutoplay();retryTimers.push(setTimeout(function(){if(!started)tryAutoplay()},500));retryTimers.push(setTimeout(function(){if(!started)tryAutoplay()},1500));retryTimers.push(setTimeout(function(){if(!started){console.log('[yt-embed] autoplay failed after retries');window.parent.postMessage({type:'yt-autoplay-failed'},${safeParentOrigin})}},2500))}startMuteSync()},onError:function(e){console.log('[yt-embed] error code='+e.data);stopMuteSync();window.parent.postMessage({type:'yt-error',code:e.data},${safeParentOrigin})},onStateChange:function(e){window.parent.postMessage({type:'yt-state',state:e.data},${safeParentOrigin});if(e.data===1||e.data===3){hideOverlay();started=true;retryTimers.forEach(clearTimeout);retryTimers=[]}}}})}setTimeout(function(){if(!started)overlay.classList.remove('hidden')},4000);window.addEventListener('message',function(e){if(!player||!player.getPlayerState)return;var m=e.data;if(!m||!m.type)return;switch(m.type){case'play':player.playVideo();break;case'pause':player.pauseVideo();break;case'mute':player.mute();break;case'unmute':player.unMute();break;case'loadVideo':if(m.videoId)player.loadVideoById(m.videoId);break;case'setQuality':if(m.quality&&player.setPlaybackQuality)player.setPlaybackQuality(m.quality);break}});window.addEventListener('beforeunload',function(){stopMuteSync();obs.disconnect();retryTimers.forEach(clearTimeout)})<\/script></body></html>`;
+      || /^https?:\/\/(?:[\w-]+\.)?tauri\.localhost(:\d{1,5})?$/.test(rawParentOrigin);
+    // A channel embeds as videoId 'live_stream' with a channel player var.
+    const safeVideoId = jsonForScript(videoId ?? 'live_stream');
+    const channelPlayerVar = channel ? `channel:${jsonForScript(channel)},` : '';
+    const safeOrigin = jsonForScript(origin);
+    const safeParentOrigin = jsonForScript(isAllowedParentOrigin ? rawParentOrigin : null);
+    const bridgePostMessageScript = isAllowedParentOrigin
+      ? `function postToParent(message){window.parent.postMessage(message,${safeParentOrigin})}`
+      : 'function postToParent(){}';
+    const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="strict-origin-when-cross-origin"><style>html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hidden}#player{width:100%;height:100%}#play-overlay{position:absolute;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;pointer-events:none;background:rgba(0,0,0,0.15)}#play-overlay svg{width:72px;height:72px;opacity:0.9;filter:drop-shadow(0 2px 8px rgba(0,0,0,0.5))}#play-overlay.hidden{display:none}</style></head><body><div id="player"></div><div id="play-overlay" class="hidden"><svg viewBox="0 0 68 48"><path d="M66.52 7.74c-.78-2.93-2.49-5.41-5.42-6.19C55.79.13 34 0 34 0S12.21.13 6.9 1.55C3.97 2.33 2.27 4.81 1.48 7.74.06 13.05 0 24 0 24s.06 10.95 1.48 16.26c.78 2.93 2.49 5.41 5.42 6.19C12.21 47.87 34 48 34 48s21.79-.13 27.1-1.55c2.93-.78 4.64-3.26 5.42-6.19C67.94 34.95 68 24 68 24s-.06-10.95-1.48-16.26z" fill="red"/><path d="M45 24L27 14v20" fill="#fff"/></svg></div><script>${bridgePostMessageScript}function tryStorageAccess(){if(document.requestStorageAccess){document.requestStorageAccess().catch(function(){})}}tryStorageAccess();var tag=document.createElement('script');tag.src='https://www.youtube.com/iframe_api';document.head.appendChild(tag);var player,overlay=document.getElementById('play-overlay'),started=false,muteSyncId,retryTimers=[];var obs=new MutationObserver(function(muts){for(var i=0;i<muts.length;i++){var nodes=muts[i].addedNodes;for(var j=0;j<nodes.length;j++){if(nodes[j].tagName==='IFRAME'){var a=nodes[j].getAttribute('allow')||'';if(a.indexOf('autoplay')===-1){nodes[j].setAttribute('allow','autoplay; encrypted-media; picture-in-picture; storage-access'+(a?'; '+a:''));console.log('[yt-embed] patched iframe allow=autoplay+storage-access')}obs.disconnect();return}}}});obs.observe(document.getElementById('player'),{childList:true,subtree:true});function hideOverlay(){overlay.classList.add('hidden')}function readMuted(){if(!player)return null;if(typeof player.isMuted==='function')return player.isMuted();if(typeof player.getVolume==='function')return player.getVolume()===0;return null}function stopMuteSync(){if(muteSyncId){clearInterval(muteSyncId);muteSyncId=null}}function startMuteSync(){if(muteSyncId)return;var last=readMuted();if(last!==null)postToParent({type:'yt-mute-state',muted:last});muteSyncId=setInterval(function(){var m=readMuted();if(m!==null&&m!==last){last=m;postToParent({type:'yt-mute-state',muted:m})}},500)}function tryAutoplay(){if(!player||!player.playVideo)return;try{player.mute();player.playVideo();console.log('[yt-embed] tryAutoplay: mute+play')}catch(e){}}function postVideoData(){var d={},duration=null,state=null;try{d=player.getVideoData()||{}}catch(e){}try{duration=player.getDuration()}catch(e){}try{state=player.getPlayerState()}catch(e){}postToParent({type:'yt-video-data',videoId:d.video_id||'',isLive:typeof d.isLive==='boolean'?d.isLive:null,title:d.title||'',author:d.author||'',duration:typeof duration==='number'?duration:null,state:typeof state==='number'?state:null})}function onYouTubeIframeAPIReady(){player=new YT.Player('player',{videoId:${safeVideoId},host:'https://www.youtube.com',playerVars:{${channelPlayerVar}autoplay:${autoplay},mute:${mute},playsinline:1,rel:0,controls:${controls},modestbranding:1,enablejsapi:1,origin:${safeOrigin},widget_referrer:${safeOrigin}},events:{onReady:function(){console.log('[yt-embed] onReady');postToParent({type:'yt-ready'});${vq ? `if(player.setPlaybackQuality)player.setPlaybackQuality(${jsonForScript(vq)});` : ''}if(${autoplay}===1){tryAutoplay();retryTimers.push(setTimeout(function(){if(!started)tryAutoplay()},500));retryTimers.push(setTimeout(function(){if(!started)tryAutoplay()},1500));retryTimers.push(setTimeout(function(){if(!started){console.log('[yt-embed] autoplay failed after retries');postToParent({type:'yt-autoplay-failed'})}},2500))}startMuteSync()},onError:function(e){console.log('[yt-embed] error code='+e.data);stopMuteSync();postToParent({type:'yt-error',code:e.data})},onStateChange:function(e){postToParent({type:'yt-state',state:e.data});if(e.data===1||e.data===3){hideOverlay();started=true;retryTimers.forEach(clearTimeout);retryTimers=[]}}}})}setTimeout(function(){if(!started)overlay.classList.remove('hidden')},4000);window.addEventListener('message',function(e){if(!${isAllowedParentOrigin}||e.origin!==${safeParentOrigin}||e.source!==window.parent)return;if(!player||!player.getPlayerState)return;var m=e.data;if(!m||!m.type)return;switch(m.type){case'play':player.playVideo();break;case'pause':player.pauseVideo();break;case'mute':player.mute();break;case'unmute':player.unMute();break;case'loadVideo':if(m.videoId)player.loadVideoById(m.videoId);break;case'setQuality':if(m.quality&&player.setPlaybackQuality)player.setPlaybackQuality(m.quality);break;case'probe':postVideoData();break}});window.addEventListener('beforeunload',function(){stopMuteSync();obs.disconnect();retryTimers.forEach(clearTimeout)})<\/script></body></html>`;
     return new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'permissions-policy': 'autoplay=*, encrypted-media=*, storage-access=(self "https://www.youtube.com")', ...makeCorsHeaders(req) } });
   }
 
@@ -1406,9 +2202,30 @@ async function dispatch(requestUrl, req, routes, context) {
     return json({ error: 'Service misconfigured: LOCAL_API_TOKEN not set' }, 503);
   }
   const authHeader = req.headers.authorization || '';
-  if (authHeader !== `Bearer ${expectedToken}`) {
+  const transportToken = req.headers[LOCAL_API_TRANSPORT_HEADER] || '';
+  const hasTransportAuth = tokenMatches(transportToken, expectedToken);
+  const hasLegacyAuth = tokenMatches(authHeader, `Bearer ${expectedToken}`);
+  if (!hasTransportAuth && !hasLegacyAuth) {
     context.logger.warn(`[local-api] unauthorized request to ${requestUrl.pathname}`);
     return json({ error: 'Unauthorized' }, 401);
+  }
+
+  if (requestUrl.pathname === '/api/selfhost-key') {
+    if (context.mode !== 'docker') return json({ error: 'Not found' }, 404);
+    return handleSelfHostKey(req, context, selfHostKey);
+  }
+
+  // Self-host relay (KTD6): ahead of local handlers, which cannot validate a
+  // desktop key without Convex. A separate decision from cloudFallback, which
+  // stays off in docker mode.
+  if (
+    context.selfHostRelay
+    && selfHostKey !== null
+    && isSelfHostRelayPath(requestUrl.pathname)
+    && selfHostRelayFetchSiteAllowed(req)
+    && shouldRelayForSelfHostKey(selfHostKey, context)
+  ) {
+    return relayToCloudWithSelfHostKey(requestUrl, req, context, selfHostKey);
   }
 
   if (requestUrl.pathname === '/api/local-status') {
@@ -1422,8 +2239,6 @@ async function dispatch(requestUrl, req, routes, context) {
       routes: routes.length,
     });
   }
-  // LLM health endpoint — mirrors probe logic from server/_shared/llm-health.ts.
-  // TODO: refactor to import getLlmHealthStatus() once handlers share a process-level module cache.
   if (requestUrl.pathname === '/api/llm-health') {
     const PROBE_TIMEOUT = 2000;
     async function probeOrigin(url, options = {}) {
@@ -1434,33 +2249,15 @@ async function dispatch(requestUrl, req, routes, context) {
         return false;
       }
     }
-    const providers = [];
-    const providerChecks = [];
-    const ollamaUrl = process.env.OLLAMA_API_URL || process.env.LLM_API_URL;
-    const groqKey = process.env.GROQ_API_KEY;
-    const openrouterKey = process.env.OPENROUTER_API_KEY;
-
-    if (ollamaUrl) {
-      try {
-        const origin = new URL(ollamaUrl).origin;
-        providerChecks.push(
-          probeOrigin(origin, { allowPrivateNetwork: true }).then((available) => ({ name: 'ollama', url: origin, available })),
-        );
-      } catch {}
-    }
-    if (groqKey?.startsWith('gsk_')) {
-      providerChecks.push(
-        probeOrigin('https://api.groq.com').then((available) => ({ name: 'groq', url: 'https://api.groq.com', available })),
-      );
-    }
-    if (openrouterKey) {
-      providerChecks.push(
-        probeOrigin('https://openrouter.ai').then((available) => ({ name: 'openrouter', url: 'https://openrouter.ai', available })),
-      );
-    }
-    if (providerChecks.length > 0) {
-      providers.push(...(await Promise.all(providerChecks)));
-    }
+    const providers = await Promise.all(
+      getConfiguredLlmHealthProviders(process.env).map(async (provider) => ({
+        name: provider.name,
+        url: provider.url,
+        available: await probeOrigin(provider.url, {
+          allowPrivateNetwork: provider.allowPrivateNetwork,
+        }),
+      })),
+    );
 
     const anyAvailable = providers.some(p => p.available);
     return json({ available: anyAvailable, providers, checkedAt: Date.now() });
@@ -1487,8 +2284,9 @@ async function dispatch(requestUrl, req, routes, context) {
     }
     return json({ verboseMode });
   }
-  // Registration — call Convex directly when CONVEX_URL is available (self-hosted),
-  // otherwise proxy to cloud (desktop sidecar never has CONVEX_URL).
+  // Registration — use the authenticated Convex HTTP bridge when CONVEX_URL is
+  // available (self-hosted), otherwise proxy to cloud (desktop sidecar never
+  // has CONVEX_URL).
   // Keeps the legacy /api/register-interest local path so older desktop builds
   // continue to work; cloud fallback rewrites to the new sebuf RPC path.
   if (requestUrl.pathname === '/api/register-interest' && req.method === 'POST') {
@@ -1509,82 +2307,126 @@ async function dispatch(requestUrl, req, routes, context) {
     }
     try {
       const body = await new Promise((resolve, reject) => {
+        if (Number(req.headers['content-length']) > MAX_REGISTRATION_BODY_BYTES) {
+          req.resume();
+          resolve(null);
+          return;
+        }
         const chunks = [];
-        req.on('data', c => chunks.push(c));
+        let bytes = 0;
+        const onData = (chunk) => {
+          bytes += chunk.length;
+          if (bytes > MAX_REGISTRATION_BODY_BYTES) {
+            chunks.length = 0;
+            req.off('data', onData);
+            req.resume();
+            resolve(null);
+            return;
+          }
+          chunks.push(chunk);
+        };
+        req.on('data', onData);
         req.on('end', () => resolve(Buffer.concat(chunks).toString()));
         req.on('error', reject);
       });
+      if (body === null) {
+        return json({ error: 'Request body too large' }, 413, { Connection: 'close' });
+      }
       const parsed = JSON.parse(body);
-      const email = parsed.email;
-      if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      const email = parsed?.email;
+      if (typeof email !== 'string' || email.length > MAX_REGISTRATION_EMAIL_LENGTH
+        || !/^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/.test(email)) {
         return json({ error: 'Invalid email address' }, 400);
       }
-      const response = await fetchWithTimeout(`${convexUrl}/api/mutation`, {
+      const sharedSecret = process.env.CONVEX_SERVER_SHARED_SECRET;
+      if (!sharedSecret) {
+        context.logger.warn('[local-api] self-hosted register-interest bridge is not configured');
+        return json({ error: 'Registration service unavailable' }, 503);
+      }
+      const convexSiteUrl = (
+        process.env.CONVEX_SITE_URL || convexUrl.replace(/\.convex\.cloud\/?$/, '.convex.site')
+      ).replace(/\/$/, '');
+      const args = {
+        email,
+        source: typeof parsed.source === 'string' ? parsed.source : 'desktop',
+        appVersion: typeof parsed.appVersion === 'string' ? parsed.appVersion : 'unknown',
+      };
+      if (typeof parsed.referredBy === 'string') args.referredBy = parsed.referredBy;
+      const response = await fetchWithTimeout(`${convexSiteUrl}/api/internal-register-interest`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          path: 'registerInterest:register',
-          args: { email, source: parsed.source || 'desktop', appVersion: parsed.appVersion || 'unknown' },
-          format: 'json',
-        }),
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'worldmonitor-sidecar/1.0',
+          'x-convex-shared-secret': sharedSecret,
+        },
+        body: JSON.stringify(args),
       }, 15000);
+      if (!response.ok) {
+        context.logger.warn(`[local-api] self-hosted register-interest bridge returned ${response.status}`);
+        return json({ error: 'Registration failed' }, 502);
+      }
       const responseBody = await response.text();
       let result;
-      try { result = JSON.parse(responseBody); } catch { result = { status: 'registered' }; }
-      if (result.status === 'error') {
-        return json({ error: result.errorMessage || 'Registration failed' }, 500);
+      try {
+        result = JSON.parse(responseBody);
+      } catch {
+        return json({ error: 'Registration failed' }, 502);
       }
-      return json(result.value || result);
+      if (!result || (result.status !== 'registered' && result.status !== 'already_registered')) {
+        return json({ error: 'Registration failed' }, 502);
+      }
+      return json({ status: 'registered', referralCode: '', referralCount: 0, position: 0, emailSuppressed: false });
     } catch (e) {
       context.logger.error(`[register-interest] error: ${e.message}`);
       return json({ error: 'Registration service unreachable' }, 502);
     }
   }
 
-  // YouTube live detection — requires residential proxy (Railway relay).
-  // Direct fetch from sidecar fails (YouTube blocks datacenter IPs).
-  // Always proxy to cloud, bypassing the cloudFallback flag.
+  // YouTube video naming for channel management (oEmbed). The cloud edge handler owns the
+  // rate limit and the retired channel-detection answer, so always proxy to cloud,
+  // bypassing the cloudFallback flag.
   if (requestUrl.pathname === '/api/youtube/live') {
-    const cloudResponse = await tryCloudFallback(requestUrl, req, context, 'youtube-live needs relay');
+    const cloudResponse = await tryCloudFallback(requestUrl, req, context, 'youtube video names come from the cloud');
     if (cloudResponse) return cloudResponse;
-    return json({ error: 'YouTube live detection unavailable' }, 503);
+    return json({ error: 'YouTube video lookup unavailable' }, 503);
   }
 
   // RSS proxy — fetch public feeds with SSRF protection
   if (requestUrl.pathname === '/api/rss-proxy') {
     const feedUrl = requestUrl.searchParams.get('url');
-    if (!feedUrl) return json({ error: 'Missing url parameter' }, 400);
+    if (!feedUrl) return rssProxyJson({ error: 'Missing url parameter' }, 400);
 
     // SSRF protection: block private IPs, reserved ranges, and DNS rebinding
     const safety = await isSafeUrl(feedUrl);
     if (!safety.safe) {
-      context.logger.warn(`[local-api] rss-proxy SSRF blocked: ${safety.reason} (url=${feedUrl})`);
-      return json({ error: safety.reason }, 403);
+      context.logger.warn(`[local-api] rss-proxy SSRF blocked: ${safety.reason} (url=${JSON.stringify(feedUrl)})`);
+      return rssProxyJson({ error: safety.reason }, 403);
     }
 
     try {
       const parsed = new URL(feedUrl);
-      // Pin to the first IPv4 address validated by isSafeUrl() so the
-      // actual TCP connection goes to the same IP we checked, closing
-      // the TOCTOU DNS-rebinding window.
-      const pinnedV4 = safety.resolvedAddresses?.find(a => a.includes('.'));
+      // Pin to an address validated by isSafeUrl() so the actual TCP
+      // connection goes to the same IP and family we checked, closing
+      // the TOCTOU DNS-rebinding window for IPv4 and IPv6-only feeds.
+      const pinned = pickPinnedAddress(safety.resolvedAddresses);
+      if (!pinned) {
+        context.logger.warn(`[local-api] rss-proxy SSRF blocked: no validated address (url=${JSON.stringify(feedUrl)})`);
+        return rssProxyJson({ error: 'Could not resolve hostname' }, 403);
+      }
       const response = await fetchWithTimeout(feedUrl, {
         headers: {
           'User-Agent': CHROME_UA,
           'Accept': 'application/rss+xml, application/xml, text/xml, */*',
           'Accept-Language': 'en-US,en;q=0.9',
         },
-        ...(pinnedV4 ? { resolvedAddress: pinnedV4 } : {}),
-      }, parsed.hostname.includes('news.google.com') ? 20000 : 12000);
-      const contentType = response.headers?.get?.('content-type') || 'application/xml';
+        resolvedAddress: pinned.address,
+        resolvedFamily: pinned.family,
+      }, parsed.hostname === 'news.google.com' ? 20000 : 12000);
       const rssBody = await response.text();
-      return new Response(rssBody || '', {
-        status: response.status,
-        headers: { 'content-type': contentType },
-      });
+      return rssProxyResponse(rssBody || '', response.status);
     } catch (e) {
       const isTimeout = e.name === 'AbortError' || e.message?.includes('timeout');
-      return json({ error: isTimeout ? 'Feed timeout' : 'Failed to fetch feed', url: feedUrl }, isTimeout ? 504 : 502);
+      return rssProxyJson({ error: isTimeout ? 'Feed timeout' : 'Failed to fetch feed', url: feedUrl }, isTimeout ? 504 : 502);
     }
   }
 
@@ -1667,14 +2509,17 @@ async function dispatch(requestUrl, req, routes, context) {
     }
   }
 
-  if (context.cloudFallback && isCloudPreferred(requestUrl.pathname)) {
+  const localOnly = await isLocalOnlyRequest(req, requestUrl.pathname);
+  const cloudPreferredAttempted = !localOnly && context.cloudFallback && isCloudPreferred(requestUrl.pathname);
+  if (cloudPreferredAttempted) {
     const cloudResponse = await tryCloudFallback(requestUrl, req, context, 'cloud-preferred');
     if (cloudResponse) return cloudResponse;
   }
+  const allowCloudFallback = !localOnly && context.cloudFallback && !cloudPreferredAttempted;
 
   const modulePath = pickModule(requestUrl.pathname, routes);
   if (!modulePath || !existsSync(modulePath)) {
-    if (context.cloudFallback) {
+    if (allowCloudFallback) {
       const cloudResponse = await tryCloudFallback(requestUrl, req, context, 'handler missing');
       if (cloudResponse) return cloudResponse;
     }
@@ -1686,7 +2531,7 @@ async function dispatch(requestUrl, req, routes, context) {
     const mod = await importHandler(modulePath);
     if (typeof mod.default !== 'function') {
       logOnce(context.logger, requestUrl.pathname, 'invalid handler module');
-      if (context.cloudFallback) {
+      if (allowCloudFallback) {
         const cloudResponse = await tryCloudFallback(requestUrl, req, context, `invalid handler module`);
         if (cloudResponse) return cloudResponse;
       }
@@ -1696,6 +2541,22 @@ async function dispatch(requestUrl, req, routes, context) {
     const body = ['GET', 'HEAD'].includes(req.method) ? undefined : await readBody(req);
     const hdrs = toHeaders(req.headers, { stripOrigin: true });
     hdrs.set('Origin', `http://127.0.0.1:${context.port}`);
+    // The OpenSky route is product-only. Its local handler requires the
+    // desktop product key in addition to the native transport token that was
+    // verified above. Inject it inside the sidecar so the renderer never sees
+    // or handles the key.
+    if (requestUrl.pathname === '/api/opensky') {
+      const productKey = process.env.WORLDMONITOR_API_KEY;
+      if (productKey) hdrs.set('X-WorldMonitor-Key', productKey);
+    }
+    // The transport credential authenticates the nginx/sidecar hop only. Do
+    // not expose it to route handlers, where Authorization is caller identity
+    // (OAuth bearer) and X-WorldMonitor-Key is the caller's API key.
+    hdrs.delete(LOCAL_API_TRANSPORT_HEADER);
+    hdrs.delete(CLOUD_USER_AUTHORIZATION_HEADER);
+    if (hdrs.get('Authorization') === `Bearer ${expectedToken}`) {
+      hdrs.delete('Authorization');
+    }
     const request = new Request(requestUrl.toString(), {
       method: req.method,
       headers: hdrs,
@@ -1705,14 +2566,14 @@ async function dispatch(requestUrl, req, routes, context) {
     const response = await mod.default(request);
     if (!(response instanceof Response)) {
       logOnce(context.logger, requestUrl.pathname, 'handler returned non-Response');
-      if (context.cloudFallback) {
+      if (allowCloudFallback) {
         const cloudResponse = await tryCloudFallback(requestUrl, req, context, 'handler returned non-Response');
         if (cloudResponse) return cloudResponse;
       }
       return json({ error: 'Handler returned invalid response', endpoint: requestUrl.pathname }, 500);
     }
 
-    if (!response.ok && context.cloudFallback) {
+    if (!response.ok && allowCloudFallback) {
       const cloudResponse = await tryCloudFallback(requestUrl, req, context, `local status ${response.status}`);
       if (cloudResponse) { cloudPreferred.add(requestUrl.pathname); return cloudResponse; }
     }
@@ -1721,11 +2582,64 @@ async function dispatch(requestUrl, req, routes, context) {
   } catch (error) {
     const reason = error.code === 'ERR_MODULE_NOT_FOUND' ? 'missing dependency' : error.message;
     logOnce(context.logger, requestUrl.pathname, reason);
-    if (context.cloudFallback) {
+    if (allowCloudFallback) {
       const cloudResponse = await tryCloudFallback(requestUrl, req, context, error);
       if (cloudResponse) { cloudPreferred.add(requestUrl.pathname); return cloudResponse; }
     }
     return json({ error: 'Local handler error', reason, endpoint: requestUrl.pathname }, 502);
+  }
+}
+
+// Test seam: lets tests shrink ipv4Fetch's idle timeouts so a silent-stall
+// test doesn't have to wait out the real production values.
+// Production code never calls this.
+export const __testing__ = {
+  isCloudPreferred,
+  canCompress,
+  jsonForScript,
+  isYahooFinanceHost,
+  setUpstreamIdleTimeoutMs(ms) {
+    _upstreamIdleTimeoutMs = ms;
+  },
+  setOllamaIdleTimeoutMs(ms) {
+    _ollamaIdleTimeoutMs = ms;
+  },
+  parseDesktopKeyVerdict,
+  setSelfHostVerdictTtlMs(ms) {
+    selfHostVerdictTtlMs = ms;
+  },
+  setSelfHostRelayTimeoutMs(ms) {
+    selfHostRelayTimeoutMs = ms;
+  },
+  resetSelfHostTimings() {
+    selfHostVerdictTtlMs = DEFAULT_SELFHOST_VERDICT_TTL_MS;
+    selfHostRelayTimeoutMs = DEFAULT_SELFHOST_RELAY_TIMEOUT_MS;
+  },
+};
+
+// Relayed responses pass through as they arrive: status, headers (minus
+// hop-by-hop and the cloud's cookies) and body bytes, unbuffered and
+// uncompressed by the sidecar.
+async function writeStreamedResponse(req, res, response, onHeaders) {
+  const headers = {};
+  for (const [name, value] of response.headers.entries()) {
+    if (!RELAY_DROPPED_RESPONSE_HEADERS.includes(name)) headers[name] = value;
+  }
+  headers['access-control-allow-origin'] = getSidecarCorsOrigin(req);
+  headers.vary = appendVary(headers.vary, 'Origin');
+  res.writeHead(response.status, headers);
+  onHeaders();
+  if (!response.body) {
+    res.end();
+    return;
+  }
+  res.flushHeaders();
+  try {
+    await pipeline(Readable.fromWeb(response.body), res);
+  } catch {
+    // The client left or the upstream broke mid-stream; headers are sent, so
+    // all that is left is to drop the connection.
+    res.destroy();
   }
 }
 
@@ -1735,8 +2649,17 @@ export async function createLocalApiServer(options = {}) {
   const routes = await buildRouteTable(context.apiDir);
   let unregisterSelfFetchOrigins = null;
 
-  const server = createServer(async (req, res) => {
-    const requestUrl = new URL(req.url || '/', `http://127.0.0.1:${context.port}`);
+  const handleRequest = async (req, res) => {
+    let requestUrl;
+    try {
+      requestUrl = new URL(req.url || '/', `http://127.0.0.1:${context.port}`);
+    } catch {
+      // A raw request-target such as `//` is not a valid relative URL and
+      // makes the WHATWG parser throw ERR_INVALID_URL.
+      res.writeHead(400, { 'content-type': 'application/json', ...makeCorsHeaders(req) });
+      res.end(JSON.stringify({ error: 'Bad request' }));
+      return;
+    }
 
     if (!requestUrl.pathname.startsWith('/api/')) {
       res.writeHead(404, { 'content-type': 'application/json', ...makeCorsHeaders(req) });
@@ -1754,6 +2677,19 @@ export async function createLocalApiServer(options = {}) {
 
     try {
       const response = await dispatch(requestUrl, req, routes, context);
+      if (streamedResponses.has(response)) {
+        await writeStreamedResponse(req, res, response, () => {
+          if (skipRecord) return;
+          recordTraffic({
+            timestamp: new Date().toISOString(),
+            method: req.method,
+            path: requestUrl.pathname + (requestUrl.search || ''),
+            status: response.status,
+            durationMs: Date.now() - start,
+          });
+        });
+        return;
+      }
       const durationMs = Date.now() - start;
       let body = Buffer.from(await response.arrayBuffer());
       const headers = Object.fromEntries(response.headers.entries());
@@ -1798,6 +2734,20 @@ export async function createLocalApiServer(options = {}) {
       res.writeHead(500, { 'content-type': 'application/json', ...makeCorsHeaders(req) });
       res.end(JSON.stringify({ error: 'Internal server error' }));
     }
+  };
+
+  // Any throw that escapes handleRequest would be an unhandled rejection,
+  // which terminates the sidecar until the app restarts.
+  const server = createServer((req, res) => {
+    handleRequest(req, res).catch((error) => {
+      context.logger.error('[local-api] unhandled request error', error);
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      res.writeHead(500, { 'content-type': 'application/json', ...makeCorsHeaders(req) });
+      res.end(JSON.stringify({ error: 'Internal server error' }));
+    });
   });
 
   return {
@@ -1828,22 +2778,42 @@ export async function createLocalApiServer(options = {}) {
       const boundPort = typeof address === 'object' && address?.port ? address.port : context.port;
       context.port = boundPort;
       const extraAllowedPrivateOrigins = [];
-      // Docker self-host ONLY: the Redis REST proxy (UPSTASH_REDIS_REST_URL)
-      // points at an internal private host (e.g. http://redis-rest:80 on a
-      // docker network). Without trusting it the SSRF guard blocks every Redis
-      // call and all /api/* return 503 REDIS_DOWN. Gated on mode === 'docker'
-      // so desktop/production startup never widens the SSRF boundary via env
-      // — the same containment as the cloudFallback=false docker policy above,
-      // and the programmatic allowPrivateFetchOrigins escape hatch stays
-      // env-free. On desktop UPSTASH_REDIS_REST_URL is a public Upstash https
-      // origin that already passes the SSRF check, so this path is docker-only.
-      if (context.mode === 'docker' && process.env.UPSTASH_REDIS_REST_URL) {
-        try {
-          extraAllowedPrivateOrigins.push(new URL(process.env.UPSTASH_REDIS_REST_URL).origin);
-        } catch (err) {
-          context.logger.warn(
-            `[local-api] UPSTASH_REDIS_REST_URL is not a valid URL; not added to the private-fetch allowlist (Redis calls will be SSRF-blocked): ${err.message}`,
-          );
+      if (context.mode === 'docker') {
+        const addConfiguredPrivateOrigin = (envKey, blockedService, toFetchUrl = (url) => url) => {
+          const rawUrl = process.env[envKey];
+          if (!rawUrl) return;
+          try {
+            extraAllowedPrivateOrigins.push(new URL(toFetchUrl(rawUrl)).origin);
+          } catch (err) {
+            context.logger.warn(
+              `[local-api] ${envKey} is not a valid URL; not added to the private-fetch allowlist (${blockedService}): ${err.message}`,
+            );
+          }
+        };
+
+        // Docker self-host ONLY: the Redis REST proxy (UPSTASH_REDIS_REST_URL)
+        // points at an internal private host (e.g. http://redis-rest:80 on a
+        // docker network). Without trusting it the SSRF guard blocks every Redis
+        // call and all /api/* return 503 REDIS_DOWN. On desktop,
+        // UPSTASH_REDIS_REST_URL is a public Upstash https origin that already
+        // passes the SSRF check, so this path is docker-only.
+        addConfiguredPrivateOrigin('UPSTASH_REDIS_REST_URL', 'Redis calls will be SSRF-blocked');
+
+        // docker-compose.yml points WS_RELAY_URL at the compose-internal relay
+        // (http://ais-relay:3004). Without trusting it, every relay-backed route
+        // (x-feed, telegram-feed, rss-proxy) is SSRF-blocked and answers 502
+        // "Hostname resolves to a private/reserved IP address".
+        // Relay handlers fetch ws(s):// values over http(s):// (getRelayBaseUrl
+        // in api/_relay.js), so trust the origin they actually fetch.
+        addConfiguredPrivateOrigin('WS_RELAY_URL', 'relay calls will be SSRF-blocked',
+          (url) => url.replace(/^ws(s?):\/\//i, 'http$1://'));
+
+        // SELF_HOSTING.md documents LLM_API_URL for compose-network or LAN
+        // endpoints; OLLAMA_API_URL is the supported desktop runtime setting.
+        // Without trusting their exact configured origins, the global SSRF
+        // guard blocks every private LLM probe and silently skips the provider.
+        for (const envKey of ['LLM_API_URL', 'OLLAMA_API_URL']) {
+          addConfiguredPrivateOrigin(envKey, 'LLM calls will be SSRF-blocked');
         }
       }
       if (context.allowPrivateRemoteBase) {
@@ -1860,20 +2830,6 @@ export async function createLocalApiServer(options = {}) {
       }
 
       context.logger.log(`[local-api] listening on http://127.0.0.1:${boundPort} (apiDir=${context.apiDir}, routes=${routes.length}, cloudFallback=${context.cloudFallback})`);
-
-      // Warm LLM health cache in background (non-blocking)
-      (async () => {
-        const urls = [
-          process.env.OLLAMA_API_URL || process.env.LLM_API_URL,
-          process.env.GROQ_API_KEY ? 'https://api.groq.com' : null,
-          process.env.OPENROUTER_API_KEY ? 'https://openrouter.ai' : null,
-        ].filter(Boolean);
-        for (const url of urls) {
-          const allowPrivateNetwork = url === process.env.OLLAMA_API_URL || url === process.env.LLM_API_URL;
-          try { await fetchWithTimeout(url, { method: 'GET', allowPrivateNetwork }, 2000); } catch {}
-        }
-        if (urls.length) console.log(`[local-api] LLM health warmed for ${urls.length} provider(s)`);
-      })();
 
       return { port: boundPort };
     },

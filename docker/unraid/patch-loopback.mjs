@@ -11,12 +11,18 @@ async function replaceExactlyOnce(path, before, after) {
 
 await replaceExactlyOnce(
   '/app/docker/redis-rest-proxy.mjs',
-  "server.listen(PORT, '0.0.0.0', () => {\n  console.log(`Redis REST proxy listening on 0.0.0.0:${PORT}`);",
-  "server.listen(PORT, process.env.REDIS_REST_HOST || '127.0.0.1', () => {\n  console.log(`Redis REST proxy listening on ${process.env.REDIS_REST_HOST || '127.0.0.1'}:${PORT}`);",
+  "const BIND_HOST = (process.env.SRH_BIND_HOST || '').trim() || '0.0.0.0';",
+  "const BIND_HOST = (process.env.SRH_BIND_HOST || process.env.REDIS_REST_HOST || '').trim() || '127.0.0.1';",
 );
 
 await replaceExactlyOnce(
   '/app/scripts/ais-relay.cjs',
-  'server.listen(PORT, () => {',
-  "server.listen(PORT, process.env.RELAY_HOST || '127.0.0.1', () => {",
+  "const RELAY_BIND_HOST = (process.env.RELAY_BIND_HOST || '').trim() || undefined;",
+  "const RELAY_BIND_HOST = (process.env.RELAY_BIND_HOST || process.env.RELAY_HOST || '').trim() || '127.0.0.1';",
+);
+
+const { PUBLIC_INVENTORY_FACTS } = await import('/app/api/_inventory-facts.generated.js');
+await writeFile(
+  '/app/scripts/shared/inventory-facts.generated.json',
+  `${JSON.stringify(PUBLIC_INVENTORY_FACTS, null, 2)}\n`,
 );

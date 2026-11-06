@@ -1,167 +1,99 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const root = resolve(__dirname, '..');
+import { findNearestHazard, haversineKm } from '../scripts/seed-chokepoint-flows.mjs';
+import { adaptDisruptionFeature, fetchAll } from '../scripts/seed-portwatch-disruptions.mjs';
 
-const src = readFileSync(resolve(root, 'scripts/seed-portwatch-disruptions.mjs'), 'utf-8');
-const flowsSrc = readFileSync(resolve(root, 'scripts/seed-chokepoint-flows.mjs'), 'utf-8');
+describe('disruptions request failures', () => {
+  it('records the query, response headers and ArcGIS details while preserving rejection', async (t) => {
+    const warnings = [];
+    t.mock.method(console, 'warn', (line) => warnings.push(line));
+    const fetch = t.mock.method(globalThis, 'fetch', async () => Response.json({
+      error: { code: 400, message: 'Invalid URL', details: ['Invalid query parameters.'] },
+    }, { headers: { 'retry-after': '60', 'set-cookie': 'private=value' } }));
 
-// ── seeder source assertions ──────────────────────────────────────────────────
+    await assert.rejects(fetchAll(), { message: 'ArcGIS disruptions error: Invalid URL' });
 
-describe('seed-portwatch-disruptions.mjs exports', () => {
-  it('exports fetchAll', () => {
-    assert.match(src, /export\s+async\s+function\s+fetchAll/);
+    const record = JSON.parse(warnings[0]);
+    assert.equal(record.event, 'portwatch_request_failure');
+    assert.equal(record.phase, 'arcgis');
+    assert.match(record.query.where, /^todate > timestamp '/);
+    assert.equal(record.status, 200);
+    assert.equal(record.headers['retry-after'], '60');
+    assert.equal(record.headers['set-cookie'], undefined);
+    assert.deepEqual(record.arcgisError.details, ['Invalid query parameters.']);
+    assert.equal(fetch.mock.callCount(), 1);
   });
 
-  // Regression guard: ArcGIS SQL parser rejects bare epoch-ms integers against
-  // Date-typed fields with "Cannot perform query. Invalid query parameters."
-  // The WHERE clause must use `timestamp '...'` literals, produced by
-  // toArcgisTimestamp(). Reverting to a raw ${sinceEpoch} breaks every run.
-  it('WHERE clause uses ArcGIS timestamp literal, not raw epoch-ms', () => {
-    assert.match(src, /todate\s*>\s*timestamp\s*'\$\{sinceSql\}'/, 'WHERE clause must compare against an ArcGIS timestamp literal');
-    assert.doesNotMatch(src, /todate\s*>\s*\$\{sinceEpoch\}/, 'WHERE clause must NOT compare against a raw epoch-ms integer');
-  });
+  it('records nested transport causes and throws the original error', async (t) => {
+    const warnings = [];
+    t.mock.method(console, 'warn', (line) => warnings.push(line));
+    const error = new TypeError('fetch failed', { cause: Object.assign(new Error('connect timed out'), { code: 'ETIMEDOUT' }) });
+    const fetch = t.mock.method(globalThis, 'fetch', async () => { throw error; });
 
-  it('toArcgisTimestamp formats epoch-ms as "YYYY-MM-DD HH:MM:SS"', async () => {
-    const mod = await import('../scripts/seed-portwatch-disruptions.mjs');
-    const formatted = mod.toArcgisTimestamp(Date.UTC(2026, 3, 13, 8, 30, 45)); // 2026-04-13T08:30:45Z
-    assert.equal(formatted, '2026-04-13 08:30:45');
-  });
+    await assert.rejects(fetchAll(), (actual) => actual === error);
 
-  it('exports validateFn', () => {
-    assert.match(src, /export\s+function\s+validateFn/);
-  });
-
-  it('writes to portwatch:disruptions:active:v1', () => {
-    assert.match(src, /portwatch:disruptions:active:v1/);
-  });
-
-  it('uses ArcGIS portwatch_disruptions_database endpoint', () => {
-    assert.match(src, /portwatch_disruptions_database.*FeatureServer/);
-  });
-
-  it('fetches 30 days of recent + active events (including NULL todate)', () => {
-    assert.match(src, /DAYS_BACK\s*=\s*30/);
-    assert.match(src, /todate > .* OR todate IS NULL/);
-  });
-
-  it('has TTL of 7200 (2 hours)', () => {
-    assert.match(src, /7[_\s]*200/);
-  });
-
-  it('extracts eventId, eventType, eventName, alertLevel, lat, lon fields', () => {
-    assert.match(src, /eventId/);
-    assert.match(src, /eventType/);
-    assert.match(src, /alertLevel/);
-    assert.match(src, /a\.lat/);
-    assert.match(src, /a\.long/);
-  });
-
-  it('parses affectedPorts from comma-separated string', () => {
-    assert.match(src, /split\(','\)/);
-  });
-
-  it('computes active flag (todate in future or null)', () => {
-    assert.match(src, /active:/);
-    assert.match(src, /a\.todate > now/);
-  });
-
-  it('wraps runSeed in isMain guard', () => {
-    assert.match(src, /isMain.*=.*process\.argv/s);
-    assert.match(src, /if\s*\(isMain\)/);
+    const record = JSON.parse(warnings[0]);
+    assert.equal(record.route, 'direct');
+    assert.equal(record.phase, 'fetch');
+    assert.equal(record.causes[1].code, 'ETIMEDOUT');
+    assert.equal(fetch.mock.callCount(), 1);
   });
 });
 
-describe('seed-chokepoint-flows.mjs hazard integration', () => {
-  it('reads portwatch:disruptions:active:v1 key', () => {
-    assert.match(flowsSrc, /portwatch:disruptions:active:v1/);
+// The seeder-source and hazard-integration assertions that used to open this
+// file restated export declarations, Redis keys, and the ArcGIS query string.
+// parseAffectedPorts, isActive, haversineKm and findNearestHazard were all
+// re-implemented in this file and tested as copies; every one of them is now
+// imported from the code that actually runs in the seeder.
+
+describe('adaptDisruptionFeature', () => {
+  const base = { eventid: 1, alertlevel: 'red', lat: 1, long: 2 };
+
+  it('splits affectedports on commas and trims each entry', () => {
+    const event = adaptDisruptionFeature({ ...base, affectedports: 'port137,port138, port139' });
+    assert.deepEqual(event.affectedPorts, ['port137', 'port138', 'port139']);
   });
 
-  it('reads disruptions in parallel with other keys', () => {
-    assert.match(flowsSrc, /DISRUPTIONS_KEY/);
+  it('drops empty segments rather than emitting blank port ids', () => {
+    const event = adaptDisruptionFeature({ ...base, affectedports: 'port137,,  ,port138,' });
+    assert.deepEqual(event.affectedPorts, ['port137', 'port138']);
   });
 
-  it('only matches RED and ORANGE alerts for hazard badge', () => {
-    assert.match(flowsSrc, /alertLevel.*RED/s);
-    assert.match(flowsSrc, /alertLevel.*ORANGE/s);
+  it('reports no affected ports when the field is absent or empty', () => {
+    assert.deepEqual(adaptDisruptionFeature(base).affectedPorts, []);
+    assert.deepEqual(adaptDisruptionFeature({ ...base, affectedports: '' }).affectedPorts, []);
   });
 
-  it('uses haversine 500km radius for hazard matching', () => {
-    assert.match(flowsSrc, /HAZARD_RADIUS_KM\s*=\s*500/);
-    assert.match(flowsSrc, /haversineKm/);
+  it('treats an event with a future end date as active', () => {
+    const now = Date.now();
+    assert.equal(adaptDisruptionFeature({ ...base, todate: now + 86_400_000 }, now).active, true);
   });
 
-  it('CHOKEPOINT_MAP entries include lat/lon coordinates', () => {
-    assert.match(flowsSrc, /hormuz.*lat:\s*26\.\d+/s);
-    assert.match(flowsSrc, /babelm.*lat:\s*12\.\d+/s);
+  it('treats an event whose end date has passed as inactive', () => {
+    const now = Date.now();
+    assert.equal(adaptDisruptionFeature({ ...base, todate: now - 86_400_000 }, now).active, false);
   });
 
-  it('disruptions read is non-fatal (catch → null)', () => {
-    assert.match(flowsSrc, /DISRUPTIONS_KEY.*catch.*null/s);
-  });
-});
-
-// ── unit tests for disruption event parsing ───────────────────────────────────
-
-function parseAffectedPorts(raw) {
-  if (!raw) return [];
-  return String(raw).split(',').map(s => s.trim()).filter(Boolean);
-}
-
-function isActive(todateMs, now) {
-  return !todateMs || todateMs > now;
-}
-
-describe('disruption event parsing', () => {
-  it('parses comma-separated affectedPorts correctly', () => {
-    assert.deepEqual(parseAffectedPorts('port137,port138, port139'), ['port137', 'port138', 'port139']);
+  it('treats an open-ended event with no end date as active', () => {
+    assert.equal(adaptDisruptionFeature(base).active, true);
   });
 
-  it('returns empty array for null affectedPorts', () => {
-    assert.deepEqual(parseAffectedPorts(null), []);
-    assert.deepEqual(parseAffectedPorts(''), []);
+  it('upper-cases the alert level so hazard matching can compare it', () => {
+    // findNearestHazard filters on 'RED' / 'ORANGE'; a lower-case feed value
+    // would silently never match.
+    assert.equal(adaptDisruptionFeature({ ...base, alertlevel: 'orange' }).alertLevel, 'ORANGE');
   });
 
-  it('marks event as active when todate is in the future', () => {
-    assert.equal(isActive(Date.now() + 86400_000, Date.now()), true);
-  });
-
-  it('marks event as inactive when todate is in the past', () => {
-    assert.equal(isActive(Date.now() - 86400_000, Date.now()), false);
-  });
-
-  it('marks event as active when todate is null (no end date)', () => {
-    assert.equal(isActive(null, Date.now()), true);
+  it('coerces missing coordinates and counts to numbers, not undefined', () => {
+    const event = adaptDisruptionFeature({ eventid: 7 });
+    assert.equal(event.lat, 0);
+    assert.equal(event.lon, 0);
+    assert.equal(event.affectedPortCount, 0);
+    assert.equal(event.toDate, null);
   });
 });
 
-// ── haversine + hazard matching ────────────────────────────────────────────────
-
-function haversineKm(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-  const toRad = d => d * Math.PI / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function findNearestHazard(events, cpLat, cpLon, radiusKm = 500) {
-  if (!Array.isArray(events)) return null;
-  let best = null;
-  let bestDist = radiusKm;
-  for (const ev of events) {
-    if (ev.alertLevel !== 'RED' && ev.alertLevel !== 'ORANGE') continue;
-    if (!ev.active) continue;
-    const dist = haversineKm(cpLat, cpLon, ev.lat, ev.lon);
-    if (dist < bestDist) { bestDist = dist; best = ev; }
-  }
-  return best;
-}
 
 describe('hazard matching', () => {
   const hormuzLat = 26.56;

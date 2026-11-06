@@ -1,3 +1,4 @@
+import { createTimeoutSignal } from '@/services/timeout-signal';
 import type { MilitaryFlight, MilitaryFlightCluster, MilitaryAircraftType, MilitaryOperator } from '@/types';
 import { createCircuitBreaker, toUniqueSortedLowercase } from '@/utils';
 import {
@@ -18,6 +19,7 @@ import {
 } from './wingbits';
 import { isFeatureAvailable } from './runtime-config';
 import { isDesktopRuntime, toApiUrl } from './runtime';
+import type { BreakerDataState } from '@/utils/circuit-breaker';
 import { MilitaryServiceClient } from '@/services/generated-rpc-clients';
 
 const militaryClient = new MilitaryServiceClient(getRpcBaseUrl(), {
@@ -121,6 +123,7 @@ function mapProtoFlight(pf: ProtoMilitaryFlight, nowDate: Date): MilitaryFlight 
 
   return {
     id: pf.id,
+    source: pf.source || undefined,
     callsign: pf.callsign,
     hexCode: pf.hexCode,
     registration: pf.registration || undefined,
@@ -156,27 +159,77 @@ function mapProtoFlight(pf: ProtoMilitaryFlight, nowDate: Date): MilitaryFlight 
   };
 }
 
+// Ceiling on cursor follows per query region. Each page returns up to 100
+// flights, so 50 pages bounds a region at 5,000 flights — far above any real
+// military-flight count while still guaranteeing termination against a server
+// that never stops emitting a fresh cursor.
+const MAX_REGION_PAGES = 50;
+
 async function fetchViaProto(): Promise<MilitaryFlight[]> {
-  // Iterate the same PACIFIC/WESTERN regions the server-side seed cron uses
-  // so dashboard coverage matches the analytic pipeline. The proto handler
-  // caches per-bbox, so parallel region calls warm independent cache keys.
+  // Request one full-world region so the seed cron's global OpenSky snapshot
+  // reaches the dashboard without being clipped back to the legacy boxes. The
+  // handler falls through to request-specific recovery when a seed snapshot
+  // declares only regional coverage.
   const results = await Promise.all(
     MILITARY_QUERY_REGIONS.map(async (region) => {
-      try {
-        const resp = await militaryClient.listMilitaryFlights({
-          pageSize: 0,
-          cursor: '',
-          neLat: region.lamax,
-          neLon: region.lomax,
-          swLat: region.lamin,
-          swLon: region.lomin,
-          operator: '' as ProtoMilitaryOperator,
-          aircraftType: '' as ProtoMilitaryAircraftType,
-        });
-        return resp.flights ?? [];
-      } catch {
-        return [];
+      // The server now bounds every response to a page, so follow next_cursor
+      // to reassemble the full region the dashboard depends on. pageSize:0 asks
+      // for the server default; a server that predates pagination omits
+      // next_cursor and the loop stops after one call.
+      //
+      // Failure posture (fail closed, matching this feature's trust model):
+      //  - A region unavailable on its FIRST call degrades to empty — a single
+      //    region being down was tolerated before pagination existed.
+      //  - A failure AFTER pages were already collected, or a cursor that does
+      //    not terminate (repeats, or exceeds the page ceiling), is a data
+      //    integrity failure. Rethrow so fetchViaProto fails and the outer
+      //    circuit breaker keeps its last COMPLETE snapshot, rather than caching
+      //    a silently truncated region.
+      const regionFlights: ProtoMilitaryFlight[] = [];
+      const seenCursors = new Set<string>();
+      let cursor = '';
+      let pagesFetched = 0;
+      for (;;) {
+        let resp: Awaited<ReturnType<typeof militaryClient.listMilitaryFlights>>;
+        try {
+          resp = await militaryClient.listMilitaryFlights({
+            pageSize: 0,
+            cursor,
+            neLat: region.lamax,
+            neLon: region.lomax,
+            swLat: region.lamin,
+            swLon: region.lomin,
+            operator: '' as ProtoMilitaryOperator,
+            aircraftType: '' as ProtoMilitaryAircraftType,
+          });
+        } catch (err) {
+          if (pagesFetched > 0) throw err;
+          return [];
+        }
+        pagesFetched += 1;
+        const pageFlights = resp.flights ?? [];
+        // We only reach a continuation request because a prior page advertised
+        // more rows. An empty continuation page therefore means the server's
+        // snapshot shrank or its live+stale data vanished between pages — a
+        // silent-truncation risk. Fail closed so the breaker keeps its last
+        // complete snapshot instead of caching page 1 alone.
+        if (cursor !== '' && pageFlights.length === 0) {
+          throw new Error('Military flight pagination returned an empty continuation page');
+        }
+        regionFlights.push(...pageFlights);
+        const next = resp.pagination?.nextCursor ?? '';
+        if (!next) break;
+        // A next cursor that equals the current one, was already visited, or
+        // pushes past the ceiling cannot make progress — abort instead of
+        // looping forever (a misbehaving or malicious server otherwise hangs
+        // this region and the enclosing Promise.all indefinitely).
+        if (next === cursor || seenCursors.has(next) || pagesFetched >= MAX_REGION_PAGES) {
+          throw new Error('Military flight pagination did not terminate');
+        }
+        seenCursors.add(next);
+        cursor = next;
       }
+      return regionFlights;
     }),
   );
 
@@ -287,17 +340,17 @@ async function fetchQueryRegion(region: QueryRegion): Promise<RegionResult> {
   const query = `lamin=${region.lamin}&lamax=${region.lamax}&lomin=${region.lomin}&lomax=${region.lomax}`;
   const urls = [`${OPENSKY_PROXY_URL}?${query}`];
   if (isLocalhostRuntime && DIRECT_OPENSKY_BASE_URL) urls.push(`${DIRECT_OPENSKY_BASE_URL}?${query}`);
-  try {
-    for (const url of urls) {
-      const response = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, { signal: createTimeoutSignal(15_000), headers: { 'Accept': 'application/json' } });
       if (!response.ok) continue;
       const data: OpenSkyResponse = await response.json();
       return { name: region.name, flights: parseOpenSkyResponse(data), ok: true };
+    } catch {
+      // A failed proxy still permits the configured localhost relay fallback.
     }
-    return { name: region.name, flights: [], ok: false };
-  } catch {
-    return { name: region.name, flights: [], ok: false };
   }
+  return { name: region.name, flights: [], ok: false };
 }
 
 const STALE_MAX_AGE_MS = 10 * 60 * 1000;
@@ -509,15 +562,23 @@ startFlightHistoryCleanup();
 export async function fetchMilitaryFlights(): Promise<{
   flights: MilitaryFlight[];
   clusters: MilitaryFlightCluster[];
+  dataState: BreakerDataState;
 }> {
   const desktop = isDesktopRuntime();
-  if (desktop && !isFeatureAvailable('openskyRelay')) return { flights: [], clusters: [] };
-  if (!desktop && !isFeatureAvailable('militaryFlights')) return { flights: [], clusters: [] };
+  const fallback = { flights: [] as MilitaryFlight[], clusters: [] as MilitaryFlightCluster[] };
+  const unavailable: BreakerDataState = { mode: 'unavailable', timestamp: null, offline: false };
+  if ((desktop && !isFeatureAvailable('openskyRelay')) || (!desktop && !isFeatureAvailable('militaryFlights'))) {
+    return { ...fallback, dataState: unavailable };
+  }
+  let completed: typeof fallback | undefined;
+  let completedState: BreakerDataState | undefined;
 
-  return breaker.execute(async () => {
+  const result = await breaker.execute(async () => {
     if (flightCache && Date.now() - flightCache.timestamp < CACHE_TTL) {
       const clusters = clusterFlights(flightCache.data);
-      return { flights: flightCache.data, clusters };
+      completed = { flights: flightCache.data, clusters };
+      completedState = { mode: 'cached', timestamp: flightCache.timestamp, offline: false };
+      return completed;
     }
 
     let flights = desktop ? await fetchFromOpenSky() : await fetchViaProto();
@@ -535,8 +596,14 @@ export async function fetchMilitaryFlights(): Promise<{
     // Generate clusters
     const clusters = clusterFlights(flights);
 
-    return { flights, clusters };
-  }, { flights: [], clusters: [] });
+    completed = { flights, clusters };
+    completedState = { mode: 'live', timestamp: flightCache.timestamp, offline: false };
+    return completed;
+  }, fallback);
+  const dataState: BreakerDataState = result === fallback ? unavailable
+    : result === completed && completedState ? completedState
+      : { mode: 'cached', timestamp: null, offline: breaker.getDataState().offline };
+  return { ...result, dataState };
 }
 
 /**

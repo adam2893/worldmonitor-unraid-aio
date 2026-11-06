@@ -21,11 +21,24 @@ export const EMBER_META_KEY = 'seed-meta:energy:ember';
 export const EMBER_TTL_SECONDS = 259200; // 72h = 3× daily cron interval
 
 const EMBER_CSV_URL =
-  'https://storage.googleapis.com/emb-prod-bkt-publicdata/public-downloads/monthly_full_release_long_format.csv';
+  'https://files.ember-energy.org/public-downloads/generation/outputs/release_generation_monthly_global.csv';
 const LOCK_DOMAIN = 'energy:ember';
 const LOCK_TTL_MS = 20 * 60 * 1000; // 20 min
 const MIN_COUNTRIES = 60;
 const MIN_COUNT_RATIO = 0.75; // abort if new count < 75% of previous
+
+export function isEmberCountDrop(newCount, previousMeta) {
+  return Boolean(
+    previousMeta
+    && typeof previousMeta === 'object'
+    && previousMeta.recordCount > 0
+    && newCount < previousMeta.recordCount * MIN_COUNT_RATIO
+  );
+}
+
+export function getPipelineFailures(results) {
+  return results.filter((result) => result?.error || result?.result === 'ERR');
+}
 
 function parseDelimitedRow(line, delimiter) {
   const cells = [];
@@ -98,17 +111,17 @@ function normalizeDate(value) {
 }
 
 /**
- * Parse Ember long-format monthly CSV.
+ * Parse the Ember monthly release CSV (one row per country, month and source).
  * Returns Map<iso2, EmberCountryData>.
  * @param {string} csvText
  * @returns {Map<string, {dataMonth: string, fossilShare: number|null, renewShare: number|null, nuclearShare: number|null, coalShare: number|null, gasShare: number|null, demandTwh: number|null}>}
  */
-// Real Ember monthly CSV column names (confirmed from header row)
+// Ember monthly release columns, read from the file's header on 2026-11-03.
+// Every Generation (TWh) value is in TWh, so the file has no unit column.
 const COLS = {
   iso3: 'ISO 3 code',
-  series: 'Variable',
-  unit: 'Unit',
-  value: 'Value',
+  series: 'Electricity source',
+  value: 'Generation (TWh)',
   date: 'Date',
 };
 
@@ -116,19 +129,23 @@ export function parseEmberCsv(csvText) {
   const rows = parseDelimitedText(csvText, ',');
   if (rows.length === 0) throw new Error('Ember CSV: no data rows');
 
-  // Schema sentinel — abort if Fossil series is missing entirely
+  const headers = Object.keys(rows[0] || {});
+  const missingColumns = Object.values(COLS).filter((column) => !headers.includes(column));
+  if (missingColumns.length > 0) {
+    throw new Error(`Ember CSV missing mapped columns: ${missingColumns.join(', ')}`);
+  }
+
   const hasFossil = rows.some((r) => String(r[COLS.series] || '').trim() === 'Fossil');
   if (!hasFossil) {
     throw new Error('Ember CSV schema changed — "Fossil" series not found; update parser');
   }
 
-  // Group by ISO 3 code, filter to TWh rows only
+  // Group by ISO 3 code
   /** @type {Map<string, Array<{date: string, series: string, value: number}>>} */
   const byIso3 = new Map();
   for (const row of rows) {
     const iso3 = String(row[COLS.iso3] || '').trim();
     if (!iso3) continue;
-    if (String(row[COLS.unit] || '').trim() !== 'TWh') continue;
 
     const value = safeFloat(row[COLS.value]);
     if (value === null) continue;
@@ -160,7 +177,7 @@ export function parseEmberCsv(csvText) {
       seriesMap.set(e.series, e.value);
     }
 
-    const total = seriesMap.get('Total Generation') ?? null;
+    const total = seriesMap.get('Total generation') ?? null;
     if (!total || total === 0) continue;
 
     const fossil = seriesMap.get('Fossil') ?? null;
@@ -243,7 +260,7 @@ async function redisGet(key) {
   return data.result ? unwrapEnvelope(JSON.parse(data.result)).data : null;
 }
 
-async function preservePreviousSnapshot(errorMsg, stashedAllMap = null, newCountryKeys = null, dataWritten = false) {
+export async function preservePreviousSnapshot(errorMsg, stashedAllMap = null, newCountryKeys = null, dataWritten = false) {
   console.error('[EmberElectricity] Preserving previous snapshot:', errorMsg);
 
   const existingMeta = await redisGet(EMBER_META_KEY).catch(() => null);
@@ -332,12 +349,10 @@ export async function main() {
 
     // Count-drop guard: abort if new count < 75% of previous
     const prevMeta = await redisGet(EMBER_META_KEY).catch(() => null);
-    if (prevMeta && typeof prevMeta === 'object' && prevMeta.recordCount > 0) {
-      if (countries.size < prevMeta.recordCount * MIN_COUNT_RATIO) {
-        throw new Error(
-          `Ember: country count dropped from ${prevMeta.recordCount} to ${countries.size} (<75% threshold) — aborting`,
-        );
-      }
+    if (isEmberCountDrop(countries.size, prevMeta)) {
+      throw new Error(
+        `Ember: country count dropped from ${prevMeta.recordCount} to ${countries.size} (<75% threshold) — aborting`,
+      );
     }
 
     newCountryKeys = new Set(countries.keys());
@@ -381,7 +396,7 @@ export async function main() {
     }
 
     const dataResults = await redisPipeline(dataCommands);
-    const dataFailures = dataResults.filter((r) => r?.error || r?.result === 'ERR');
+    const dataFailures = getPipelineFailures(dataResults);
     if (dataFailures.length > 0) {
       throw new Error(
         `Redis pipeline: ${dataFailures.length}/${dataCommands.length} data commands failed`,
@@ -405,8 +420,16 @@ export async function main() {
 }
 
 if (process.argv[1]?.endsWith('seed-ember-electricity.mjs')) {
-  main().catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
+  // Terminal success marker. Emitted from .then() so it can ONLY print after main() has fully
+  // resolved — a throw anywhere inside, including a late publish step, skips it. Any marker
+  // written INSIDE main() would print before later work and could vouch for a run that then
+  // died (exactly how #6092 stayed invisible). Format mirrors runSeed() so the crash
+  // diagnostic recognises it; without it a clean run is indistinguishable from a silent death.
+  const __runStartedAt = Date.now();
+  main()
+    .then(() => console.log(`\n=== Done (${Date.now() - __runStartedAt}ms) ===`))
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
 }

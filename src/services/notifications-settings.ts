@@ -1,3 +1,5 @@
+import { WEB_APP_ORIGIN } from '@/config/web-origin';
+import { openExternalUrl } from '@/services/external-navigation';
 import { escapeHtml } from '@/utils/sanitize';
 import { renderSVG } from 'uqr';
 import {
@@ -5,6 +7,9 @@ import {
   createPairingToken,
   setEmailChannel,
   setWebhookChannel,
+  setTeamsChannel,
+  sendChannelTest,
+  type ChannelOAuthLaunch,
   startSlackOAuth,
   startDiscordOAuth,
   deleteChannel,
@@ -20,8 +25,10 @@ import {
 } from '@/services/notification-channels';
 import { getCurrentClerkUser } from '@/services/clerk';
 import { hasTier } from '@/services/entitlements';
+import { t } from '@/services/i18n';
 import { getMarketWatchlistEntries } from '@/services/market-watchlist';
 import { SITE_VARIANT } from '@/config/variant';
+import { CHOKEPOINT_REGISTRY } from '@/config/chokepoint-registry';
 import { mountCountryChipPicker, loadFollowedCountriesSafe, type CountryChipPickerHandle } from '@/utils/country-chip-picker';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
 
@@ -35,6 +42,8 @@ const DIGEST_CRON_ENABLED = import.meta.env.VITE_DIGEST_CRON_ENABLED !== '0';
 // story's extracted tickers. Enabling the toggle sends the current market
 // watchlist symbols as `tickers`; the watchlist-modal save path re-syncs them.
 const WATCHLIST_STORY_EVENT_TYPE = 'watchlist_story_alert';
+// Opt-in like the watchlist row; scoped by alertRules.chokepoints (#9217).
+const CHOKEPOINT_DISRUPTION_EVENT_TYPE = 'chokepoint_disruption';
 
 export interface NotificationsSettingsHost {
   isSignedIn?: boolean;
@@ -67,12 +76,113 @@ function normalizePreselectCountry(input: string | undefined): string | null {
   return trimmed;
 }
 
+function submitChannelOAuthForm(popup: Window, launch: ChannelOAuthLaunch): void {
+  const form = popup.document.createElement('form');
+  form.method = 'POST';
+  form.action = launch.browserBinding.url;
+  const input = popup.document.createElement('input');
+  input.type = 'hidden';
+  input.name = 'token';
+  input.value = launch.browserBinding.token;
+  form.appendChild(input);
+  popup.document.body.appendChild(form);
+  form.submit();
+}
+
 function appendNotificationError(rowEl: HTMLElement, message: string): void {
   rowEl.querySelector('.us-notif-error')?.remove();
   const errorEl = document.createElement('span');
   errorEl.className = 'us-notif-error';
+  errorEl.setAttribute('role', 'alert');
   errorEl.textContent = message;
   rowEl.appendChild(errorEl);
+}
+
+type WebPushSettingsState = 'available' | 'denied' | 'unsupported';
+
+const WEB_PUSH_BLOCKED_BADGE = 'Blocked';
+const WEB_PUSH_UNSUPPORTED_BADGE = 'Not supported';
+
+function browserPushBlockedMessage(): string {
+  return t('components.proActivation.steps.alerts.blockedNote', {
+    defaultValue:
+      "Notifications are blocked in your browser. Turn them on in your browser's site settings to get alerts.",
+  });
+}
+
+function browserPushUnsupportedMessage(): string {
+  return 'This browser or in-app webview does not support web push notifications.';
+}
+
+// User-Agent is long and ugly. Surface a short label only: "Chrome",
+// "Firefox", "Safari", etc. Shared by the connected row and the
+// connected-but-denied row so the two can't drift.
+function webPushDeviceLabel(channel: NotificationChannel): string {
+  const ua = channel.userAgent ?? '';
+  return /Firefox\/|Chrome\/|Edge\/|Safari\//.exec(ua)?.[0]?.replace('/', '') ?? 'This device';
+}
+
+async function readWebPushSettingsState(): Promise<WebPushSettingsState> {
+  try {
+    const { getPushPermission, isWebPushSupported } = await import('@/services/push-notifications');
+    if (!isWebPushSupported()) return 'unsupported';
+    return getPushPermission() === 'denied' ? 'denied' : 'available';
+  } catch {
+    return 'unsupported';
+  }
+}
+
+// Single writer for the two runtime web-push transitions, so the imperative
+// path can't drift from the equivalent template branches in renderChannelRow.
+function applyWebPushRowState(
+  rowEl: HTMLElement,
+  state: 'denied' | 'unsupported',
+  message: string,
+  badgeClass: string,
+  badgeLabel: string,
+): void {
+  rowEl.dataset.webPushState = state;
+  rowEl.querySelector('.us-notif-error')?.remove();
+  const sub = rowEl.querySelector<HTMLElement>('.us-notif-ch-sub');
+  if (sub) {
+    // Role FIRST: a live region that is created already-populated has no
+    // content change for assistive tech to announce.
+    if (state === 'denied') sub.setAttribute('role', 'status');
+    else sub.removeAttribute('role');
+    sub.classList.add('us-notif-ch-sub-wrap');
+    sub.textContent = message;
+  }
+  const actions = rowEl.querySelector<HTMLElement>('.us-notif-ch-actions');
+  if (actions) {
+    const badge = document.createElement('span');
+    badge.className = badgeClass;
+    badge.textContent = badgeLabel;
+    // Preserve Remove: a channel registered on this account stays removable
+    // even once this browser can no longer subscribe.
+    const remove = actions.querySelector('.us-notif-disconnect');
+    actions.replaceChildren(badge);
+    if (remove) actions.appendChild(remove);
+  }
+}
+
+function showWebPushBlockedState(rowEl: HTMLElement): void {
+  applyWebPushRowState(
+    rowEl,
+    'denied',
+    browserPushBlockedMessage(),
+    'us-notif-ch-badge us-notif-ch-badge-blocked',
+    WEB_PUSH_BLOCKED_BADGE,
+  );
+}
+
+function showWebPushUnsupportedState(rowEl: HTMLElement): void {
+  applyWebPushRowState(
+    rowEl,
+    'unsupported',
+    browserPushUnsupportedMessage(),
+    'us-notif-ch-badge',
+    WEB_PUSH_UNSUPPORTED_BADGE,
+  );
 }
 
 function getTelegramBotUsername(): string {
@@ -83,6 +193,11 @@ function getTelegramBotUsername(): string {
   }
 }
 
+/**
+ * Settings → Notifications: channel and alert-rule controls for signed-in Pro
+ * users, otherwise an "Upgrade to Pro" prompt that opens the /pro plan picker.
+ * `attach` wires the rendered markup and returns its cleanup function.
+ */
 export function renderNotificationsSettings(host: NotificationsSettingsHost): NotificationsSettingsResult {
   const isPro = !!host.isSignedIn && hasTier(1);
   const preselectCountry = normalizePreselectCountry(host.preselectCountry);
@@ -112,12 +227,12 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
           upgradeBtn.addEventListener('click', () => {
             if (!host.isSignedIn) {
               import('@/services/clerk').then(m => m.openSignIn()).catch(() => {
-                window.open('https://worldmonitor.app/pro', '_blank', 'noopener,noreferrer');
+                void openExternalUrl(`${WEB_APP_ORIGIN}/pro`);
               });
               return;
             }
-            import('@/services/checkout').then(m => import('@/config/products').then(p => m.startCheckout(p.DEFAULT_UPGRADE_PRODUCT))).catch(() => {
-              window.open('https://worldmonitor.app/pro', '_blank', 'noopener,noreferrer');
+            import('@/services/upgrade-flow').then(m => m.openUpgradePlans()).catch(() => {
+              void openExternalUrl(`${WEB_APP_ORIGIN}/pro`);
             });
           }, { signal });
         }
@@ -139,16 +254,59 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         if (type === 'telegram') return `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>`;
         if (type === 'email') return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>`;
         if (type === 'web_push') return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>`;
+        if (type === 'teams') return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`;
         if (type === 'webhook') return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>`;
         if (type === 'discord') return `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>`;
         return `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M5.042 15.165a2.528 2.528 0 0 1-2.52 2.523A2.528 2.528 0 0 1 0 15.165a2.527 2.527 0 0 1 2.522-2.52h2.52v2.52zm1.271 0a2.527 2.527 0 0 1 2.521-2.52 2.527 2.527 0 0 1 2.521 2.52v6.313A2.528 2.528 0 0 1 8.834 24a2.528 2.528 0 0 1-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 0 1-2.521-2.52A2.528 2.528 0 0 1 8.834 0a2.528 2.528 0 0 1 2.521 2.522v2.52H8.834zm0 1.271a2.528 2.528 0 0 1 2.521 2.521 2.528 2.528 0 0 1-2.521 2.521H2.522A2.528 2.528 0 0 1 0 8.834a2.528 2.528 0 0 1 2.522-2.521h6.312zm10.122 2.521a2.528 2.528 0 0 1 2.522-2.521A2.528 2.528 0 0 1 24 8.834a2.528 2.528 0 0 1-2.522 2.521h-2.522V8.834zm-1.268 0a2.528 2.528 0 0 1-2.523 2.521 2.527 2.527 0 0 1-2.52-2.521V2.522A2.527 2.527 0 0 1 15.165 0a2.528 2.528 0 0 1 2.523 2.522v6.312zm-2.523 10.122a2.528 2.528 0 0 1 2.523 2.522A2.528 2.528 0 0 1 15.165 24a2.527 2.527 0 0 1-2.52-2.522v-2.522h2.52zm0-1.268a2.527 2.527 0 0 1-2.52-2.523 2.526 2.526 0 0 1 2.52-2.52h6.313A2.527 2.527 0 0 1 24 15.165a2.528 2.528 0 0 1-2.522 2.523h-6.313z"/></svg>`;
       }
 
-      const CHANNEL_LABELS: Record<ChannelType, string> = { telegram: 'Telegram', email: 'Email', slack: 'Slack', discord: 'Discord', webhook: 'Webhook', web_push: 'Browser Push' };
+      const CHANNEL_LABELS: Record<ChannelType, string> = { telegram: 'Telegram', email: 'Email', slack: 'Slack', discord: 'Discord', teams: 'Microsoft Teams', webhook: 'Webhook', web_push: 'Browser Push' };
 
-      function renderChannelRow(channel: NotificationChannel | null, type: ChannelType): string {
+      function renderChannelRow(
+        channel: NotificationChannel | null,
+        type: ChannelType,
+        webPushState: WebPushSettingsState,
+      ): string {
         const icon = channelIcon(type);
         const name = CHANNEL_LABELS[type];
+
+        if (type === 'web_push' && webPushState === 'denied') {
+          // Push permission is per-BROWSER; the web_push channel record is
+          // per-ACCOUNT (convex keys it by userId + channelType and transfers
+          // it across devices). So a denial here says nothing about whether the
+          // account is receiving push — it may be live on another device.
+          //
+          // A connected account therefore keeps the connected presentation, and
+          // critically keeps `us-notif-ch-on`: getCurrentAlertRuleFormState()
+          // derives the persisted `channels` array from that class, so dropping
+          // it would silently delete web_push from the alert rule on the next
+          // autosave (sensitivity, quiet hours, country picker, connecting any
+          // other channel...) with no way to re-add it while denied.
+          if (channel?.verified) {
+            return `<div class="us-notif-ch-row us-notif-ch-on" data-channel-type="web_push" data-web-push-state="denied">
+              <div class="us-notif-ch-icon">${icon}</div>
+              <div class="us-notif-ch-body">
+                <div class="us-notif-ch-name">${name}</div>
+                <div class="us-notif-ch-sub">${escapeHtml(webPushDeviceLabel(channel))}</div>
+                <div class="us-notif-ch-sub us-notif-ch-sub-wrap us-notif-ch-sub-warn" role="status">${escapeHtml(browserPushBlockedMessage())}</div>
+              </div>
+              <div class="us-notif-ch-actions">
+                <span class="us-notif-ch-badge">Connected</span>
+                <button type="button" class="us-notif-ch-btn us-notif-disconnect" data-channel="web_push">Remove</button>
+              </div>
+            </div>`;
+          }
+          return `<div class="us-notif-ch-row" data-channel-type="web_push" data-web-push-state="denied">
+            <div class="us-notif-ch-icon">${icon}</div>
+            <div class="us-notif-ch-body">
+              <div class="us-notif-ch-name">${name}</div>
+              <div class="us-notif-ch-sub us-notif-ch-sub-wrap" role="status">${escapeHtml(browserPushBlockedMessage())}</div>
+            </div>
+            <div class="us-notif-ch-actions">
+              <span class="us-notif-ch-badge us-notif-ch-badge-blocked">${WEB_PUSH_BLOCKED_BADGE}</span>
+            </div>
+          </div>`;
+        }
 
         if (channel?.verified) {
           let sub: string;
@@ -159,14 +317,16 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             sub = escapeHtml(channel.email ?? 'connected');
           } else if (type === 'discord') {
             sub = 'Connected';
+          } else if (type === 'teams') {
+            sub = 'Workflows webhook';
+            manageLink = `<button type="button" class="us-notif-ch-btn" id="usTeamsTest">Send test</button>`;
           } else if (type === 'webhook') {
-            sub = channel.webhookLabel ? escapeHtml(channel.webhookLabel) : 'Connected';
+            const label = channel.webhookLabel ? escapeHtml(channel.webhookLabel) : 'Connected';
+            sub = channel.webhookSigned
+              ? `${label} · Signed`
+              : `${label} · <span class="us-notif-ch-sub-warn" title="Remove this webhook and add it again to get a signing secret.">Unsigned, re-add to sign</span>`;
           } else if (type === 'web_push') {
-            // User-Agent is long and ugly. Surface a short label only:
-            // "Chrome", "Firefox", "Safari", etc.
-            const ua = channel.userAgent ?? '';
-            const browser = /Firefox\/|Chrome\/|Edge\/|Safari\//.exec(ua)?.[0]?.replace('/', '') ?? 'This device';
-            sub = escapeHtml(browser);
+            sub = escapeHtml(webPushDeviceLabel(channel));
           } else {
             const rawCh = channel.slackChannelName ?? '';
             const ch = rawCh ? `#${escapeHtml(rawCh.startsWith('#') ? rawCh.slice(1) : rawCh)}` : 'connected';
@@ -248,6 +408,19 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
           </div>`;
         }
 
+        if (type === 'teams') {
+          return `<div class="us-notif-ch-row" data-channel-type="teams">
+            <div class="us-notif-ch-icon">${icon}</div>
+            <div class="us-notif-ch-body">
+              <div class="us-notif-ch-name">${name}</div>
+              <div class="us-notif-ch-sub">Post alert cards to a channel through a Workflows webhook</div>
+            </div>
+            <div class="us-notif-ch-actions">
+              <button type="button" class="us-notif-ch-btn us-notif-ch-btn-primary" id="usConnectTeams">Add URL</button>
+            </div>
+          </div>`;
+        }
+
         if (type === 'webhook') {
           return `<div class="us-notif-ch-row" data-channel-type="webhook">
             <div class="us-notif-ch-icon">${icon}</div>
@@ -262,7 +435,19 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         }
 
         if (type === 'web_push') {
-          return `<div class="us-notif-ch-row" data-channel-type="web_push">
+          if (webPushState === 'unsupported') {
+            return `<div class="us-notif-ch-row" data-channel-type="web_push" data-web-push-state="unsupported">
+              <div class="us-notif-ch-icon">${icon}</div>
+              <div class="us-notif-ch-body">
+                <div class="us-notif-ch-name">${name}</div>
+                <div class="us-notif-ch-sub us-notif-ch-sub-wrap">${escapeHtml(browserPushUnsupportedMessage())}</div>
+              </div>
+              <div class="us-notif-ch-actions">
+                <span class="us-notif-ch-badge">${WEB_PUSH_UNSUPPORTED_BADGE}</span>
+              </div>
+            </div>`;
+          }
+          return `<div class="us-notif-ch-row" data-channel-type="web_push" data-web-push-state="available">
             <div class="us-notif-ch-icon">${icon}</div>
             <div class="us-notif-ch-body">
               <div class="us-notif-ch-name">${name}</div>
@@ -279,15 +464,18 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
 
       const detectedTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-      function renderNotifContent(data: Awaited<ReturnType<typeof getChannelsData>>): string {
-        const channelTypes: ChannelType[] = ['telegram', 'email', 'slack', 'discord', 'webhook', 'web_push'];
+      function renderNotifContent(
+        data: Awaited<ReturnType<typeof getChannelsData>>,
+        webPushState: WebPushSettingsState,
+      ): string {
+        const channelTypes: ChannelType[] = ['telegram', 'email', 'slack', 'discord', 'teams', 'webhook', 'web_push'];
         const alertRule = data.alertRules?.[0] ?? null;
         const sensitivity = alertRule?.sensitivity ?? 'all';
 
         let html = '<div class="ai-flow-section-label">Channels</div>';
         for (const type of channelTypes) {
           const channel = data.channels.find(c => c.channelType === type) ?? null;
-          html += renderChannelRow(channel, type);
+          html += renderChannelRow(channel, type, webPushState);
         }
 
         const qhEnabled = alertRule?.quietHoursEnabled ?? false;
@@ -298,6 +486,8 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         const digestMode = alertRule?.digestMode ?? 'realtime';
         const digestHour = alertRule?.digestHour ?? 8;
         const aiDigestEnabled = alertRule?.aiDigestEnabled ?? true;
+        const chokepointAlertsOn = alertRule?.eventTypes?.includes(CHOKEPOINT_DISRUPTION_EVENT_TYPE) ?? false;
+        const chokepointScope = alertRule?.chokepoints ?? [];
 
         const hourOptions = Array.from({ length: 24 }, (_, h) => {
           const label = h === 0 ? '12 AM' : h < 12 ? `${h} AM` : h === 12 ? '12 PM' : `${h - 12} PM`;
@@ -342,7 +532,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
 
         html += `<div class="ai-flow-section-label" style="margin-top:8px">Delivery Mode</div>
           ${!DIGEST_CRON_ENABLED ? '<div class="ai-flow-toggle-desc" style="margin-bottom:4px">Digest delivery is not yet active.</div>' : ''}
-          <select class="unified-settings-select" id="usDigestMode"${!DIGEST_CRON_ENABLED ? ' disabled' : ''}>
+          <select class="unified-settings-select" id="usDigestMode" aria-label="Delivery mode"${!DIGEST_CRON_ENABLED ? ' disabled' : ''}>
             <option value="realtime"${isRealtime ? ' selected' : ''}>Real-time (immediate)</option>
             ${DIGEST_CRON_ENABLED ? `<option value="daily"${digestMode === 'daily' ? ' selected' : ''}>Daily digest</option>
             <option value="twice_daily"${digestMode === 'twice_daily' ? ' selected' : ''}>Twice daily</option>
@@ -355,7 +545,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             docs/archive/plans/forbid-realtime-all-events.md §2a.
           -->
           <div class="ai-flow-section-label" style="margin-top:8px">Sensitivity</div>
-          <select class="unified-settings-select" id="usNotifSensitivity">
+          <select class="unified-settings-select" id="usNotifSensitivity" aria-label="Notification sensitivity">
             <option value="all"${isRealtime ? ' disabled' : ''}${sensitivity === 'all' && !isRealtime ? ' selected' : ''}>All events${isRealtime ? ' (digest only)' : ''}</option>
             <option value="high"${isRealtime ? ' disabled' : ''}${sensitivity === 'high' && !isRealtime ? ' selected' : ''}>High &amp; critical${isRealtime ? ' (digest only)' : ''}</option>
             <option value="critical"${sensitivity === 'critical' || ((sensitivity === 'all' || sensitivity === 'high') && isRealtime) ? ' selected' : ''}>Critical only</option>
@@ -383,6 +573,23 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
                 <span class="ai-flow-slider"></span>
               </label>
             </div>
+            <div class="ai-flow-toggle-row">
+              <div class="ai-flow-toggle-label-wrap">
+                <div class="ai-flow-toggle-label">Chokepoint disruption alerts</div>
+                <div class="ai-flow-toggle-desc">Alert when warnings, AIS disruption or a traffic drop push a shipping chokepoint into the red, well above its usual threat level</div>
+              </div>
+              <label class="ai-flow-switch">
+                <input type="checkbox" id="usChokepointAlerts"${chokepointAlertsOn ? ' checked' : ''}>
+                <span class="ai-flow-slider"></span>
+              </label>
+            </div>
+            <div id="usChokepointScope"${chokepointAlertsOn ? '' : ' hidden'}>
+              <div class="ai-flow-toggle-desc" style="margin-bottom:6px">Pick chokepoints, or leave none selected to cover all of them.</div>
+              <div class="us-notif-country-chips">${CHOKEPOINT_REGISTRY.map((cp) => {
+                const on = chokepointScope.includes(cp.id);
+                return `<button type="button" class="us-notif-country-chip${on ? ' us-notif-country-chip-on' : ''}" data-chokepoint-id="${escapeHtml(cp.id)}" aria-pressed="${on}">${escapeHtml(cp.displayName)}</button>`;
+              }).join('')}</div>
+            </div>
             <div class="ai-flow-section-label" style="margin-top:8px">Quiet Hours</div>
             <div class="ai-flow-toggle-row">
               <div class="ai-flow-toggle-label-wrap">
@@ -399,15 +606,15 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
                 <div class="ai-flow-toggle-label-wrap" style="min-width:60px">
                   <div class="ai-flow-toggle-label">From</div>
                 </div>
-                <select class="unified-settings-select" id="usQhStart" style="width:auto">${hourOptions}</select>
+                <select class="unified-settings-select" id="usQhStart" aria-label="Quiet hours start" style="width:auto">${hourOptions}</select>
                 <div class="ai-flow-toggle-label-wrap" style="min-width:30px">
                   <div class="ai-flow-toggle-label">To</div>
                 </div>
-                <select class="unified-settings-select" id="usQhEnd" style="width:auto">${hourOptionsEnd}</select>
+                <select class="unified-settings-select" id="usQhEnd" aria-label="Quiet hours end" style="width:auto">${hourOptionsEnd}</select>
               </div>
               <div style="margin-top:4px">
                 <div class="ai-flow-toggle-label" style="margin-bottom:4px">During quiet hours</div>
-                <select class="unified-settings-select" id="usQhOverride">
+                <select class="unified-settings-select" id="usQhOverride" aria-label="During quiet hours">
                   <option value="critical_only"${qhOverride === 'critical_only' ? ' selected' : ''}>Critical only (suppress others)</option>
                   <option value="silence_all"${qhOverride === 'silence_all' ? ' selected' : ''}>Silence all</option>
                   ${QUIET_HOURS_BATCH_ENABLED ? `<option value="batch_on_wake"${qhOverride === 'batch_on_wake' ? ' selected' : ''}>Batch — deliver on wake</option>` : ''}
@@ -420,7 +627,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
               <div class="ai-flow-toggle-label-wrap" style="min-width:60px">
                 <div class="ai-flow-toggle-label">Send at</div>
               </div>
-              <select class="unified-settings-select" id="usDigestHour" style="width:auto">${hourOptionsDigest}</select>
+              <select class="unified-settings-select" id="usDigestHour" aria-label="Digest send hour" style="width:auto">${hourOptionsDigest}</select>
             </div>
             <div id="usTwiceDailyHint" class="ai-flow-toggle-desc" style="margin-top:4px;${digestMode === 'twice_daily' ? '' : 'display:none'}">Also sends at ${((digestHour + 12) % 24) === 0 ? '12 AM' : ((digestHour + 12) % 24) < 12 ? `${(digestHour + 12) % 24} AM` : ((digestHour + 12) % 24) === 12 ? '12 PM' : `${((digestHour + 12) % 24) - 12} PM`}</div>
             <div class="ai-flow-toggle-row" style="margin-top:8px">
@@ -429,16 +636,16 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
                 <div class="ai-flow-toggle-desc">Prepend a personalized intelligence brief tailored to your watchlist and interests</div>
               </div>
               <label class="ai-flow-switch">
-                <input type="checkbox" id="usAiDigestEnabled"${aiDigestEnabled ? ' checked' : ''}>
+                <input type="checkbox" id="usAiDigestEnabled" aria-label="AI executive summary"${aiDigestEnabled ? ' checked' : ''}>
                 <span class="ai-flow-slider"></span>
               </label>
             </div>
           </div>
           <div class="ai-flow-section-label" style="margin-top:8px">Country scope</div>
-          <div class="ai-flow-toggle-desc" style="margin-bottom:6px">Restrict alerts to specific countries (ISO-3166 alpha-2). Leave empty to receive alerts from all countries. When set, global alerts without a country (markets, shipping) are excluded; breaking-news alerts are still delivered.</div>
+          <div class="ai-flow-toggle-desc" style="margin-bottom:6px">Restrict alerts to specific countries (ISO-3166 alpha-2). Leave empty to receive alerts from all countries. When set, global alerts without a country (markets, shipping stress) are excluded; breaking-news and chokepoint alerts are still delivered.</div>
           <div id="usNotifCountryPicker"></div>
           <div class="ai-flow-section-label" style="margin-top:8px">Timezone</div>
-          <select class="unified-settings-select" id="usSharedTimezone" style="width:100%">${makeTzOptions(sharedTz)}</select>`;
+          <select class="unified-settings-select" id="usSharedTimezone" aria-label="Timezone" style="width:100%">${makeTzOptions(sharedTz)}</select>`;
         return html;
       }
 
@@ -456,6 +663,12 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
       let qhDebounceTimer: ReturnType<typeof setTimeout> | null = null;
       let digestDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+      // Last web-push state actually rendered, so the permission watchers below
+      // only re-render when it really changed.
+      let renderedWebPushState: WebPushSettingsState | null = null;
+      let requestedWebPushState: WebPushSettingsState | null = null;
+      let notifReloadGeneration = 0;
+
       // Fire-and-forget settings writes MUST NOT surface as unhandled promise
       // rejections. A debounced auto-save that 401s (expired Clerk session) or
       // hits a transient network error is expected and non-fatal — swallow it
@@ -463,20 +676,38 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
       // Logged for local debugging only; the setting simply isn't persisted.
       function fireForgetSave(p: Promise<unknown>, label: string): void {
         void p.catch((err) => {
+          if (signal.aborted) return;
+          // Legacy set-alert-rules can still hit INCOMPATIBLE_DELIVERY (e.g.
+          // sensitivity save against an existing realtime row). Surface the
+          // server message on the sensitivity hint rather than only logging.
+          if (err instanceof IncompatibleDeliveryError) {
+            const hint = container.querySelector<HTMLElement>('#usSensitivityHint');
+            if (hint) {
+              hint.style.display = '';
+              hint.textContent = err.message;
+            }
+            return;
+          }
           console.warn(`[notifications] ${label} failed (not saved):`, err);
         });
       }
 
       function reloadNotifSection(): void {
+        const generation = ++notifReloadGeneration;
         const loadingEl = container.querySelector<HTMLElement>('#usNotifLoading');
         const contentEl = container.querySelector<HTMLElement>('#usNotifContent');
         if (!loadingEl || !contentEl) return;
         loadingEl.style.display = 'block';
         contentEl.style.display = 'none';
         if (signal.aborted) return;
-        getChannelsData().then((data) => {
-          if (signal.aborted) return;
-          setTrustedHtml(contentEl, trustedHtml(renderNotifContent(data), "legacy direct innerHTML migration"));
+        Promise.all([
+          getChannelsData(undefined, signal),
+          readWebPushSettingsState(),
+        ]).then(([data, webPushState]) => {
+          if (signal.aborted || generation !== notifReloadGeneration) return;
+          renderedWebPushState = webPushState;
+          requestedWebPushState = null;
+          setTrustedHtml(contentEl, trustedHtml(renderNotifContent(data, webPushState), "legacy direct innerHTML migration"));
           loadingEl.style.display = 'none';
           contentEl.style.display = 'block';
 
@@ -517,6 +748,8 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
 
           countryPicker = mountCountryChipPicker(pickerRoot, {
             initial,
+            // The section description above already carries the empty-state hint.
+            showAllHint: false,
             onChange: () => {
               // Debounced save through the existing alertRule pipeline.
               if (alertRuleDebounceTimer) clearTimeout(alertRuleDebounceTimer);
@@ -526,7 +759,8 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             },
           });
         }).catch((err) => {
-          if (signal.aborted) return;
+          if (signal.aborted || generation !== notifReloadGeneration) return;
+          requestedWebPushState = null;
           console.error('[notifications] Failed to load settings:', err);
           if (loadingEl) loadingEl.textContent = 'Failed to load notification settings.';
         });
@@ -554,11 +788,13 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         aiDigestEnabled: boolean;
         countries: string[] | undefined;
         tickers: string[];
+        chokepoints: string[];
       } {
         const enabledEl = container.querySelector<HTMLInputElement>('#usNotifEnabled');
         const sensitivityEl = container.querySelector<HTMLSelectElement>('#usNotifSensitivity');
         const aiDigestEl = container.querySelector<HTMLInputElement>('#usAiDigestEnabled');
         const watchlistEl = container.querySelector<HTMLInputElement>('#usWatchlistAlerts');
+        const chokepointEl = container.querySelector<HTMLInputElement>('#usChokepointAlerts');
         const connectedChannelTypes = Array.from(
           container.querySelectorAll<HTMLElement>('[data-channel-type]'),
         )
@@ -574,14 +810,26 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         // restores the broadcast wildcard ([]) and clears tickers so no
         // stale scope lingers server-side.
         const watchlistOn = watchlistEl?.checked ?? false;
+        // Chokepoint disruption alerts (#9217): same opt-in shape. No chips
+        // selected means every chokepoint; OFF clears the scope.
+        const chokepointOn = chokepointEl?.checked ?? false;
+        const eventTypes = [
+          ...(watchlistOn ? [WATCHLIST_STORY_EVENT_TYPE] : []),
+          ...(chokepointOn ? [CHOKEPOINT_DISRUPTION_EVENT_TYPE] : []),
+        ];
         return {
           enabled: enabledEl?.checked ?? false,
-          eventTypes: watchlistOn ? [WATCHLIST_STORY_EVENT_TYPE] : [],
+          eventTypes,
           sensitivity: (sensitivityEl?.value ?? 'all') as 'all' | 'high' | 'critical',
           channels: connectedChannelTypes,
           aiDigestEnabled: aiDigestEl?.checked ?? true,
           countries: alertRuleCountries,
           tickers: watchlistOn ? getMarketWatchlistEntries().map((e) => e.symbol) : [],
+          chokepoints: chokepointOn
+            ? Array.from(container.querySelectorAll<HTMLElement>('#usChokepointScope .us-notif-country-chip-on'))
+              .map((el) => el.dataset.chokepointId ?? '')
+              .filter(Boolean)
+            : [],
         };
       }
 
@@ -593,10 +841,50 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         fireForgetSave(saveAlertRules({
           variant: SITE_VARIANT,
           ...state,
-        }), 'save alert rules');
+        }, signal), 'save alert rules');
       }
 
       reloadNotifSection();
+
+      // The blocked copy sends the user to their BROWSER's site settings, which
+      // is an in-page action: nothing here remounts afterwards (a settings
+      // tab-switch is a guarded no-op in UnifiedSettings.attachNotificationsTab).
+      // Without a watcher the row would stay on "Blocked" with no Enable button
+      // after the user did exactly what we asked, so re-read the permission and
+      // re-render when it actually changes.
+      function resyncWebPushState(): void {
+        if (signal.aborted) return;
+        void readWebPushSettingsState().then((state) => {
+          if (signal.aborted) return;
+          if (
+            renderedWebPushState === null
+            || state === renderedWebPushState
+            || state === requestedWebPushState
+          ) return;
+          // Coalesce the permission listener and focus fallback without
+          // claiming the state as rendered until the reload actually wins.
+          requestedWebPushState = state;
+          reloadNotifSection();
+        });
+      }
+
+      // Chromium/Firefox fire this the moment the site-settings toggle flips.
+      void (async () => {
+        try {
+          const status = await navigator.permissions.query({
+            name: 'notifications' as PermissionName,
+          });
+          if (signal.aborted) return;
+          status.addEventListener('change', resyncWebPushState, { signal });
+        } catch {
+          // Safari and older browsers don't expose the notifications
+          // permission descriptor — the focus fallback below covers them.
+        }
+      })();
+
+      // Fallback for browsers without the permission descriptor: changing site
+      // settings there takes focus away and returns it.
+      window.addEventListener('focus', resyncWebPushState, { signal });
 
       function saveRuleWithNewChannel(newChannel: ChannelType): void {
         const state = getCurrentAlertRuleFormState();
@@ -606,7 +894,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
           variant: SITE_VARIANT,
           ...state,
           channels,
-        }), 'save alert rules');
+        }, signal), 'save alert rules');
       }
 
       signal.addEventListener('abort', () => {
@@ -640,7 +928,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             quietHoursTimezone: tzEl?.value || detectedTz,
             quietHoursOverride: (overrideEl?.value ?? 'critical_only') as QuietHoursOverride,
             countries: countryPicker ? countryPicker.getValue() : undefined,
-          }), 'save quiet hours');
+          }, signal), 'save quiet hours');
         }, 800);
       };
 
@@ -656,7 +944,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             digestHour: hourEl ? Number(hourEl.value) : 8,
             digestTimezone: tzEl?.value || detectedTz,
             countries: countryPicker ? countryPicker.getValue() : undefined,
-          }), 'save digest settings');
+          }, signal), 'save digest settings');
         }, 800);
       };
 
@@ -733,14 +1021,22 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
                   digestHour: hourEl ? Number(hourEl.value) : 8,
                   digestTimezone: tzEl?.value || detectedTz,
                   ...(snappedSensitivity ? { sensitivity: snappedSensitivity } : {}),
-                });
+                }, undefined, signal);
               } catch (err) {
                 if (err instanceof IncompatibleDeliveryError) {
                   const hint = container.querySelector<HTMLElement>('#usSensitivityHint');
                   if (hint) hint.textContent = err.message;
                   return;
                 }
-                throw err;
+                // This IIFE is `void`-ed with no .catch(), so a rethrow here
+                // escapes as an unhandled rejection and reaches
+                // window.onunhandledrejection — the exact WORLDMONITOR-SN
+                // invariant fireForgetSave exists to uphold. Every sibling save
+                // in this file routes through fireForgetSave; this one cannot,
+                // because it needs the IncompatibleDeliveryError branch above.
+                // So swallow the same way fireForgetSave does instead.
+                if (signal.aborted) return;
+                console.warn('[notifications] save digest mode failed (not saved):', err);
               }
             })();
           }, 800);
@@ -780,11 +1076,14 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
               variant: SITE_VARIANT,
               ...state,
               aiDigestEnabled: target.checked,
-            }), 'save alert rules');
+            }, signal), 'save alert rules');
           }, 500);
           return;
         }
-        if (target.id === 'usNotifEnabled' || target.id === 'usNotifSensitivity' || target.id === 'usWatchlistAlerts') {
+        if (target.id === 'usChokepointAlerts') {
+          container.querySelector<HTMLElement>('#usChokepointScope')?.toggleAttribute('hidden', !(target as HTMLInputElement).checked);
+        }
+        if (target.id === 'usNotifEnabled' || target.id === 'usNotifSensitivity' || target.id === 'usWatchlistAlerts' || target.id === 'usChokepointAlerts') {
           if (alertRuleDebounceTimer) clearTimeout(alertRuleDebounceTimer);
           alertRuleDebounceTimer = setTimeout(() => {
             // Source from the centralized helper so `countries` flows through.
@@ -792,13 +1091,24 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             fireForgetSave(saveAlertRules({
               variant: SITE_VARIANT,
               ...state,
-            }), 'save alert rules');
+            }, signal), 'save alert rules');
           }, 1000);
         }
       }, { signal });
 
       container.addEventListener('click', (e) => {
         const target = e.target as HTMLElement;
+
+        const chokepointChip = target.closest<HTMLElement>('#usChokepointScope [data-chokepoint-id]');
+        if (chokepointChip) {
+          const on = chokepointChip.classList.toggle('us-notif-country-chip-on');
+          chokepointChip.setAttribute('aria-pressed', String(on));
+          if (alertRuleDebounceTimer) clearTimeout(alertRuleDebounceTimer);
+          alertRuleDebounceTimer = setTimeout(() => {
+            saveCurrentAlertRule();
+          }, 800);
+          return;
+        }
 
         if (target.closest('.us-notif-tg-copy-btn')) {
           const btn = target.closest('.us-notif-tg-copy-btn') as HTMLButtonElement;
@@ -826,7 +1136,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
 
         const startTelegramPairing = (rowEl: HTMLElement) => {
           setTrustedHtml(rowEl, trustedHtml(`<div class="us-notif-ch-icon">${channelIcon('telegram')}</div><div class="us-notif-ch-body"><div class="us-notif-ch-name">Telegram</div><div class="us-notif-ch-sub">Generating code…</div></div>`, "legacy direct innerHTML migration"));
-          createPairingToken().then(({ token, expiresAt }) => {
+          createPairingToken(signal).then(({ token, expiresAt }) => {
             if (signal.aborted) return;
             const botUsername = getTelegramBotUsername();
             const deepLink = `https://t.me/${String(botUsername)}?start=${token}`;
@@ -837,7 +1147,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
               <div class="us-notif-ch-icon">${channelIcon('telegram')}</div>
               <div class="us-notif-ch-body">
                 <div class="us-notif-ch-name">Connect Telegram</div>
-                <div class="us-notif-ch-sub">Open the bot. If Telegram doesn't send the code automatically, paste this command.</div>
+                <div class="us-notif-ch-sub us-notif-ch-sub-wrap">Open the bot and tap Confirm when it asks. If Telegram doesn't send the code automatically, paste this command.</div>
                 <div class="us-notif-tg-pair-layout">
                   <div class="us-notif-tg-cmd-col">
                     <a href="${escapeHtml(deepLink)}" target="_blank" rel="noopener noreferrer" class="us-notif-tg-link">Open Telegram</a>
@@ -875,7 +1185,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
                 `, "legacy direct innerHTML migration"));
                 return;
               }
-              getChannelsData().then((data) => {
+              getChannelsData(undefined, signal).then((data) => {
                 const tg = data.channels.find(c => c.channelType === 'telegram');
                 if (tg?.verified) {
                   clearNotifPoll();
@@ -906,9 +1216,13 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             }
             return;
           }
-          setEmailChannel(email).then(() => {
+          setEmailChannel(email, undefined, signal).then(() => {
             if (!signal.aborted) { saveRuleWithNewChannel('email'); reloadNotifSection(); }
-          }).catch(() => {});
+          }).catch((error: unknown) => {
+            if (signal.aborted) return;
+            const rowEl = target.closest('.us-notif-ch-row') as HTMLElement | null;
+            if (rowEl) appendNotificationError(rowEl, error instanceof Error ? error.message : 'Could not connect email. Please try again.');
+          });
           return;
         }
 
@@ -918,20 +1232,19 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             slackOAuthPopup.focus();
             return;
           }
+          const popup = window.open('', 'slack-oauth', 'width=600,height=700,menubar=no,toolbar=no');
+          if (!popup) {
+            const rowEl = btn?.closest<HTMLElement>('[data-channel-type="slack"]');
+            if (rowEl) appendNotificationError(rowEl, 'Popup blocked. Allow popups for this site, then try again.');
+            return;
+          }
+          slackOAuthPopup = popup;
           if (btn) btn.textContent = 'Connecting…';
-          startSlackOAuth().then((oauthUrl) => {
-            if (signal.aborted) return;
-            const popup = window.open(oauthUrl, 'slack-oauth', 'width=600,height=700,menubar=no,toolbar=no');
-            if (!popup) {
-              if (btn) btn.textContent = 'Add to Slack';
-              const rowEl = btn?.closest<HTMLElement>('[data-channel-type="slack"]');
-              if (rowEl) {
-                appendNotificationError(rowEl, 'Popup blocked — please allow popups for this site, then try again.');
-              }
-            } else {
-              slackOAuthPopup = popup;
-            }
+          startSlackOAuth(signal).then((launch) => {
+            if (signal.aborted || popup.closed) { popup.close(); return; }
+            submitChannelOAuthForm(popup, launch);
           }).catch(() => {
+            popup.close();
             if (btn && !signal.aborted) btn.textContent = 'Add to Slack';
           });
           return;
@@ -943,21 +1256,93 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             discordOAuthPopup.focus();
             return;
           }
+          const popup = window.open('', 'discord-oauth', 'width=600,height=700,menubar=no,toolbar=no');
+          if (!popup) {
+            const rowEl = btn?.closest<HTMLElement>('[data-channel-type="discord"]');
+            if (rowEl) appendNotificationError(rowEl, 'Popup blocked. Allow popups for this site, then try again.');
+            return;
+          }
+          discordOAuthPopup = popup;
           if (btn) btn.textContent = 'Connecting…';
-          startDiscordOAuth().then((oauthUrl) => {
-            if (signal.aborted) return;
-            const popup = window.open(oauthUrl, 'discord-oauth', 'width=600,height=700,menubar=no,toolbar=no');
-            if (!popup) {
-              if (btn) btn.textContent = 'Connect Discord';
-              const rowEl = btn?.closest<HTMLElement>('[data-channel-type="discord"]');
-              if (rowEl) {
-                appendNotificationError(rowEl, 'Popup blocked — please allow popups for this site, then try again.');
-              }
-            } else {
-              discordOAuthPopup = popup;
-            }
+          startDiscordOAuth(signal).then((launch) => {
+            if (signal.aborted || popup.closed) { popup.close(); return; }
+            submitChannelOAuthForm(popup, launch);
           }).catch(() => {
+            popup.close();
             if (btn && !signal.aborted) btn.textContent = 'Connect Discord';
+          });
+          return;
+        }
+
+        if (target.closest('#usConnectTeams')) {
+          const rowEl = target.closest<HTMLElement>('[data-channel-type="teams"]');
+          if (!rowEl) return;
+          const actionsEl = rowEl.querySelector<HTMLElement>('.us-notif-ch-actions')!;
+          // The form takes the full row width; the instructions would otherwise
+          // stretch the non-shrinking actions box past the row edge.
+          actionsEl.style.flex = '1 1 100%';
+          actionsEl.style.minWidth = '0';
+          setTrustedHtml(actionsEl, trustedHtml(`
+            <div style="display:flex;flex-direction:column;gap:6px;width:100%">
+              <input type="url" id="usTeamsUrl" placeholder="https://….environment.api.powerplatform.com/powerautomate/…" class="unified-settings-input" style="font-size:12px;width:100%" autocomplete="off">
+              <div class="us-notif-ch-sub us-notif-ch-sub-wrap">In Teams, open the channel's Workflows, choose "Send webhook alerts to a channel", and paste the webhook URL it gives you.</div>
+              <div style="display:flex;gap:6px">
+                <button type="button" class="us-notif-ch-btn us-notif-ch-btn-primary" id="usTeamsSave">Save</button>
+                <button type="button" class="us-notif-ch-btn" id="usTeamsCancel">Cancel</button>
+              </div>
+            </div>`, "static Teams webhook form"));
+          rowEl.querySelector<HTMLInputElement>('#usTeamsUrl')?.focus();
+          return;
+        }
+        if (target.closest('#usTeamsSave')) {
+          const rowEl = container.querySelector<HTMLElement>('[data-channel-type="teams"]');
+          const urlInput = container.querySelector<HTMLInputElement>('#usTeamsUrl');
+          const url = urlInput?.value?.trim() ?? '';
+          if (!url || !url.startsWith('https://')) {
+            urlInput?.classList.add('us-notif-input-error');
+            return;
+          }
+          const saveBtn = target.closest<HTMLButtonElement>('#usTeamsSave');
+          if (saveBtn?.disabled) return;
+          if (saveBtn) {
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Saving...';
+          }
+          rowEl?.querySelector('.us-notif-error')?.remove();
+          setTeamsChannel(url, signal).then(() => {
+            if (signal.aborted) return;
+            saveRuleWithNewChannel('teams');
+            reloadNotifSection();
+          }).catch((err: unknown) => {
+            if (signal.aborted) return;
+            urlInput?.classList.add('us-notif-input-error');
+            if (rowEl) appendNotificationError(rowEl, err instanceof Error ? err.message : 'Could not connect Teams. Please try again.');
+            if (saveBtn) {
+              saveBtn.disabled = false;
+              saveBtn.textContent = 'Save';
+            }
+          });
+          return;
+        }
+        if (target.closest('#usTeamsCancel')) {
+          reloadNotifSection();
+          return;
+        }
+        if (target.closest('#usTeamsTest')) {
+          const btn = target.closest<HTMLButtonElement>('#usTeamsTest');
+          const rowEl = container.querySelector<HTMLElement>('[data-channel-type="teams"]');
+          if (!btn || btn.disabled) return;
+          btn.disabled = true;
+          btn.textContent = 'Sending...';
+          rowEl?.querySelector('.us-notif-error')?.remove();
+          sendChannelTest('teams', signal).then(() => {
+            if (signal.aborted) return;
+            btn.textContent = 'Test sent';
+          }).catch((err: unknown) => {
+            if (signal.aborted) return;
+            btn.disabled = false;
+            btn.textContent = 'Send test';
+            if (rowEl) appendNotificationError(rowEl, err instanceof Error ? err.message : 'Could not send a test message. Please try again.');
           });
           return;
         }
@@ -987,12 +1372,46 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             return;
           }
           const saveBtn = target.closest<HTMLButtonElement>('#usWebhookSave');
-          if (saveBtn) saveBtn.textContent = 'Saving...';
-          setWebhookChannel(url, labelInput?.value?.trim() || undefined).then(() => {
-            if (!signal.aborted) { saveRuleWithNewChannel('webhook'); reloadNotifSection(); }
+          // Each save rotates the secret, so a second in-flight save could
+          // land its response last and show a secret that no longer verifies.
+          if (saveBtn?.disabled) return;
+          if (saveBtn) {
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Saving...';
+          }
+          setWebhookChannel(url, labelInput?.value?.trim() || undefined, signal).then(({ signingSecret }) => {
+            if (signal.aborted) return;
+            saveRuleWithNewChannel('webhook');
+            const rowEl = container.querySelector<HTMLElement>('[data-channel-type="webhook"]');
+            if (!signingSecret || !rowEl) { reloadNotifSection(); return; }
+            // Mark the row connected so a rule save made while the secret is
+            // on screen (getCurrentAlertRuleFormState) keeps the webhook.
+            rowEl.classList.add('us-notif-ch-on');
+            // The secret is shown once; the server keeps only an encrypted copy.
+            setTrustedHtml(rowEl, trustedHtml(`
+              <div class="us-notif-ch-icon">${channelIcon('webhook')}</div>
+              <div class="us-notif-ch-body">
+                <div class="us-notif-ch-name">Webhook signing secret</div>
+                <div class="us-notif-ch-sub us-notif-ch-sub-wrap">Copy it now; it won't be shown again. Verify the X-WM-Signature header on each delivery with it.</div>
+                <div class="us-notif-tg-cmd-row">
+                  <code class="us-notif-tg-cmd" id="usWebhookSecret" style="white-space:normal;word-break:break-all;user-select:all">${escapeHtml(signingSecret)}</code>
+                  <button type="button" class="us-notif-tg-copy-btn" data-cmd="${escapeHtml(signingSecret)}">Copy</button>
+                </div>
+              </div>
+              <div class="us-notif-ch-actions">
+                <button type="button" class="us-notif-ch-btn us-notif-ch-btn-primary" id="usWebhookSecretDone">Done</button>
+              </div>
+            `, "webhook signing secret, escaped"));
           }).catch(() => {
-            if (saveBtn && !signal.aborted) saveBtn.textContent = 'Save';
+            if (saveBtn && !signal.aborted) {
+              saveBtn.disabled = false;
+              saveBtn.textContent = 'Save';
+            }
           });
+          return;
+        }
+        if (target.closest('#usWebhookSecretDone')) {
+          reloadNotifSection();
           return;
         }
         if (target.closest('#usWebhookCancel')) {
@@ -1002,28 +1421,61 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
 
         if (target.closest('#usConnectWebPush')) {
           const btn = target.closest<HTMLButtonElement>('#usConnectWebPush');
+          // Re-query rather than capture: Notification.requestPermission() has
+          // no timeout, and any sibling channel action (webhook cancel/save,
+          // email connect, a disconnect, a Slack/Discord OAuth message, the
+          // Telegram pairing poll) can call reloadNotifSection() meanwhile,
+          // which replaces the whole content subtree. A node captured before
+          // the prompt would then be detached and the blocked/unsupported/error
+          // result would be written somewhere the user can never see.
+          const liveRow = (): HTMLElement | null =>
+            container.querySelector<HTMLElement>('[data-channel-type="web_push"]');
+          const liveBtn = (): HTMLButtonElement | null =>
+            container.querySelector<HTMLButtonElement>('#usConnectWebPush');
           if (btn) {
             btn.disabled = true;
             btn.textContent = 'Requesting…';
           }
           (async () => {
+            let pushRuntime: typeof import('@/services/push-notifications') | null = null;
             try {
-              const { subscribeToPush, isWebPushSupported } = await import('@/services/push-notifications');
-              if (!isWebPushSupported()) {
-                if (btn) {
-                  btn.disabled = false;
-                  btn.textContent = 'Not supported';
-                  btn.setAttribute('title', 'This browser (or in-app webview) does not support web push notifications.');
-                }
+              pushRuntime = await import('@/services/push-notifications');
+              if (signal.aborted) return;
+              if (!pushRuntime.isWebPushSupported()) {
+                const row = liveRow();
+                if (row) showWebPushUnsupportedState(row);
                 return;
               }
-              await subscribeToPush();
+              if (pushRuntime.getPushPermission() === 'denied') {
+                const row = liveRow();
+                if (row) showWebPushBlockedState(row);
+                return;
+              }
+              await pushRuntime.subscribeToPush();
               if (!signal.aborted) { saveRuleWithNewChannel('web_push'); reloadNotifSection(); }
             } catch (err) {
               console.warn('[notif] web_push subscribe failed:', err);
-              if (btn && !signal.aborted) {
-                btn.disabled = false;
-                btn.textContent = 'Enable';
+              if (signal.aborted) return;
+              const row = liveRow();
+              const permission = pushRuntime?.getPushPermission();
+              if (permission === 'denied') {
+                if (row) showWebPushBlockedState(row);
+                return;
+              }
+              if (pushRuntime && !pushRuntime.isWebPushSupported()) {
+                if (row) showWebPushUnsupportedState(row);
+                return;
+              }
+              const enableBtn = liveBtn();
+              if (enableBtn) {
+                enableBtn.disabled = false;
+                enableBtn.textContent = 'Enable';
+              }
+              if (row) {
+                appendNotificationError(
+                  row,
+                  'Could not enable browser notifications. Try again.',
+                );
               }
             }
           })();
@@ -1050,7 +1502,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             })();
             return;
           }
-          deleteChannel(channelType).then(() => {
+          deleteChannel(channelType, signal).then(() => {
             if (!signal.aborted) reloadNotifSection();
           }).catch(() => {});
           return;

@@ -27,18 +27,33 @@ vi.mock('../_shared/rate-limit', async (importActual) => {
     ...actual,
     checkRateLimit: (...a: unknown[]) => checkRateLimit(...a),
     checkEndpointRateLimit: (...a: unknown[]) => checkEndpointRateLimit(...a),
+    checkFailClosedScopedIpRateLimit: async () => null,
     hasEndpointRatePolicy: () => false,
   };
 });
 
+vi.mock('../_shared/user-api-key', () => ({
+  validateUserApiKeyPrincipal: async (key: string) => ({ userId: 'same-account', keyId: key, keyKind: 'api', keyHash: key.slice(3), activeKeyRank: 0 }),
+}));
+vi.mock('../_shared/desktop-key-principal', async (importActual) => ({
+  ...await importActual<typeof import('../_shared/desktop-key-principal')>(),
+  resolveUserKeyEntitlement: async () => ({ validUntil: Date.now() + 60000, planKey: 'api_starter', features: { tier: 1, apiAccess: true, apiRateLimit: 0 } }),
+  resolveUserKeyScope: () => ({ scope: 'api' }),
+}));
+vi.mock('../_shared/entitlement-check', async (importActual) => ({
+  ...await importActual<typeof import('../_shared/entitlement-check')>(),
+  checkEntitlementDetailed: async () => ({ response: null, entitlements: null }),
+}));
+
 import { createDomainGateway } from '../gateway';
 import { IDEMPOTENCY_HEADER, IDEMPOTENT_REPLAYED_HEADER } from '../_shared/idempotency';
+import { markRetryableResponse, setResponseHeader } from '../_shared/response-headers';
 
 const PATH = '/api/leads/v1/submit-contact';
 const ctx = { waitUntil: () => {} };
 
 const handler = vi.fn(
-  async () =>
+  async (_request: Request) =>
     new Response(JSON.stringify({ ok: true, id: 'lead_1' }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -75,6 +90,33 @@ beforeEach(() => {
 });
 
 describe('gateway Idempotency-Key', () => {
+  test('webhook responses replay only for the credential that owns the webhook', async () => {
+    const records = new Map<string, string>();
+    runRedisPipeline.mockImplementation(async (commands: string[][]) => commands.map(([verb, key, value, ...options]) => {
+      if (verb === 'GET') return { result: records.get(key) ?? null };
+      if (verb === 'SET') {
+        if (options.includes('NX') && records.has(key)) return { result: null };
+        records.set(key, value);
+        return { result: 'OK' };
+      }
+      return { result: 1 };
+    }));
+    const path = '/api/v2/shipping/webhooks';
+    let executions = 0;
+    const gateway = createDomainGateway([{ method: 'POST', path, handler: async () => Response.json({ signingSecret: `secret-${++executions}` }) }]);
+    const request = (digit: string) => new Request(`https://www.worldmonitor.app${path}`, {
+      method: 'POST', headers: { 'X-Api-Key': `wm_${digit.repeat(40)}`, 'Content-Type': 'application/json', 'Idempotency-Key': 'known-key' }, body: '{}',
+    });
+    const first = await gateway(request('a'), ctx);
+    expect(first.status).toBe(200);
+    const secretA = await first.json();
+    const second = await gateway(request('b'), ctx);
+    expect(second.status).toBe(200);
+    expect(await second.json()).not.toEqual(secretA);
+    const replay = await gateway(request('a'), ctx);
+    expect(await replay.json()).toEqual(secretA);
+    expect(executions).toBe(2);
+  });
   test('POST without the header is untouched (no Redis, no echo header)', async () => {
     const res = await makeGateway()(post(undefined), ctx);
     expect(handler).toHaveBeenCalledTimes(1);
@@ -221,5 +263,57 @@ describe('gateway Idempotency-Key', () => {
     expect(res.status).toBe(429);
     const releaseCmd = runRedisPipeline.mock.calls[2][0][0];
     expect(releaseCmd[0]).toBe('DEL');
+  });
+
+  test('an in-band retryable response releases the lock so the same key can recover', async () => {
+    handler
+      .mockImplementationOnce(async (request: Request) => {
+        markRetryableResponse(request);
+        setResponseHeader(request, 'Retry-After', '5');
+        setResponseHeader(
+          request,
+          'X-Billing-Verification',
+          'entitlement_verification_unavailable',
+        );
+        return new Response(JSON.stringify({
+          errorType: 'ServiceError',
+          statusDetail: 'entitlement_verification_unavailable',
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      })
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ ok: true, id: 'lead_recovered' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+    runRedisPipeline
+      .mockResolvedValueOnce([{ result: null }]) // first peek miss
+      .mockResolvedValueOnce([{ result: 'OK' }, { result: null }]) // first claim
+      .mockResolvedValueOnce([{ result: 1 }]) // first response releases the lock
+      .mockResolvedValueOnce([{ result: null }]) // retry sees no completed record
+      .mockResolvedValueOnce([{ result: 'OK' }, { result: null }]) // retry claims
+      .mockResolvedValueOnce([{ result: 'OK' }]); // recovered response is stored
+
+    const gateway = makeGateway();
+    const transient = await gateway(post('key-in-band-retryable'), ctx);
+    expect(transient.status).toBe(200);
+    expect(transient.headers.get('Retry-After')).toBe('5');
+    expect(transient.headers.get('X-Billing-Verification')).toBe(
+      'entitlement_verification_unavailable',
+    );
+    expect(await transient.json()).toEqual({
+      errorType: 'ServiceError',
+      statusDetail: 'entitlement_verification_unavailable',
+    });
+    expect(runRedisPipeline.mock.calls[2][0][0][0]).toBe('DEL');
+
+    const recovered = await gateway(post('key-in-band-retryable'), ctx);
+    expect(recovered.status).toBe(200);
+    expect(handler).toHaveBeenCalledTimes(2);
+    expect(await recovered.json()).toEqual({ ok: true, id: 'lead_recovered' });
+    expect(runRedisPipeline.mock.calls[5][0][0][0]).toBe('SET');
   });
 });

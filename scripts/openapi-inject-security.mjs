@@ -26,10 +26,11 @@
  *      The generator's YAML emitter cannot be reproduced by js-yaml (a re-dump
  *      reformats ~100% of 21k lines), so YAML gets formatting-preserving
  *      surgical insertions. Each YAML artifact receives the SAME contract its
- *      JSON sibling carries (#4650): top-level securitySchemes (2 or 3 by
- *      bearer-path presence) + root API-key security + the UnauthorizedError
- *      schema + per-operation 401 / public security:[] opt-outs / bearer
- *      stamping, then per-operation entitlement/public 403 responses and notes.
+ *      JSON sibling carries (#4650): top-level securitySchemes (API key, plus
+ *      BearerAuth and TrustReviewKey by path presence) + root API-key security +
+ *      the UnauthorizedError schema + per-operation 401 / public security:[]
+ *      opt-outs / bearer and review-key stamping, then per-operation
+ *      entitlement/public 403 responses and notes.
  *      Like the sibling injectors this runs in the `make generate` codegen
  *      context (no npm deps guaranteed), so it has no external imports: paths
  *      are enumerated by text scan and all writes are surgical text insertions.
@@ -45,6 +46,8 @@ import {
   readEndpointEntitlements,
   readPremiumRpcPaths,
   PUBLIC_FORBIDDEN_GATES,
+  TRUST_REVIEW_KEY_PATHS,
+  LAPSED_BILLING_STATUS,
 } from './lib/openapi-codegen.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -62,7 +65,8 @@ const PUBLIC_PATHS = readPublicNoAuthPaths();
 const ENDPOINT_ENTITLEMENTS = readEndpointEntitlements();
 const ENDPOINT_ENTITLEMENT_PATHS = new Set(ENDPOINT_ENTITLEMENTS.keys());
 const PREMIUM_RPC_PATHS = new Set(readPremiumRpcPaths());
-const BEARER_AUTH_PATHS = new Set([...ENDPOINT_ENTITLEMENT_PATHS, ...PREMIUM_RPC_PATHS]);
+const COUNTRY_HISTORY_PATH = '/api/intelligence/v1/get-country-history';
+const BEARER_AUTH_PATHS = new Set([...ENDPOINT_ENTITLEMENT_PATHS, ...PREMIUM_RPC_PATHS, COUNTRY_HISTORY_PATH]);
 if (BEARER_AUTH_PATHS.size === 0) {
   throw new Error('bearer-auth path sources parsed as empty — refusing to run');
 }
@@ -87,6 +91,18 @@ const PREMIUM_ONLY_PATHS = new Set(
 for (const path of PUBLIC_FORBIDDEN_GATES.keys()) {
   if (ENDPOINT_ENTITLEMENTS.has(path)) {
     throw new Error(`${path} is in both ENDPOINT_ENTITLEMENTS and PUBLIC_FORBIDDEN_GATES — the 403 contract would oscillate; a path cannot be both PRO-entitlement-gated and public-bot-gated`);
+  }
+}
+
+// Review-key routes rely on the gateway skipping the API-key check, and carry
+// their own 401 instead of an entitlement or bot-verification 403. Fail closed
+// if a path ever lands in a set that contradicts that.
+for (const path of TRUST_REVIEW_KEY_PATHS) {
+  if (!PUBLIC_PATHS.has(path)) {
+    throw new Error(`${path} is in TRUST_REVIEW_KEY_PATHS but not PUBLIC_NO_AUTH_RPC_PATHS — the gateway would demand an API key before the review key is checked`);
+  }
+  if (BEARER_AUTH_PATHS.has(path) || PUBLIC_FORBIDDEN_GATES.has(path)) {
+    throw new Error(`${path} is in TRUST_REVIEW_KEY_PATHS and a bearer or public-403 source — a path has exactly one auth contract`);
   }
 }
 
@@ -118,6 +134,15 @@ const SECURITY_SCHEMES = {
   },
 };
 
+const TRUST_REVIEW_SECURITY_SCHEMES = {
+  TrustReviewKey: {
+    type: 'apiKey',
+    in: 'header',
+    name: 'X-Trust-Review-Key',
+    description: 'Operator review key (the server TRUST_REVIEW_SECRET). Required by the error-report review operations; a WorldMonitor API key does not authorize them.',
+  },
+};
+
 // Root requirement — any ONE API-key scheme satisfies it (OpenAPI OR
 // semantics). BearerAuth is narrower and is stamped only on operations the
 // gateway actually accepts bearer sessions for.
@@ -130,6 +155,21 @@ const BEARER_OPERATION_SECURITY = [
   ...ROOT_SECURITY,
   { BearerAuth: [] },
 ];
+
+const OPTIONAL_HISTORY_SECURITY = [{}, ...BEARER_OPERATION_SECURITY];
+
+const TRUST_REVIEW_OPERATION_SECURITY = [{ TrustReviewKey: [] }];
+
+// The handler throws ApiError(401, 'Unauthorized'), which error-mapper renders
+// as the generated Error schema (`{ message }`), not UnauthorizedError.
+const TRUST_REVIEW_UNAUTHORIZED_RESPONSE = {
+  description: 'Missing or invalid X-Trust-Review-Key, or review is not configured on the server.',
+  content: {
+    'application/json': {
+      schema: { $ref: '#/components/schemas/Error' },
+    },
+  },
+};
 
 const UNAUTHORIZED_SCHEMA = {
   type: 'object',
@@ -150,12 +190,22 @@ const UNAUTHORIZED_RESPONSE = {
   },
 };
 
+const OPTIONAL_HISTORY_UNAUTHORIZED_RESPONSE = {
+  ...UNAUTHORIZED_RESPONSE,
+  description: 'Invalid supplied credentials. Omit credentials for seven-day access.',
+};
+
 const FORBIDDEN_SCHEMA = {
   type: 'object',
   description:
     'Returned when a PRO-gated endpoint denies access because the caller has no resolved authenticated user, entitlements cannot be verified, or the caller lacks the required entitlement tier.',
   properties: {
     error: { type: 'string', description: 'Human-readable entitlement failure reason.' },
+    code: {
+      type: 'string',
+      enum: [LAPSED_BILLING_STATUS],
+      description: 'Machine-readable denial code, present when the 403 is a billing-provider-confirmed subscription lapse (mirrored in the X-Billing-Verification response header).',
+    },
     requiredTier: {
       type: 'integer',
       format: 'int32',
@@ -171,8 +221,21 @@ const FORBIDDEN_SCHEMA = {
   required: ['error'],
 };
 
+// Provider-confirmed subscription lapses answer any authenticated route with a
+// 403 whose X-Billing-Verification header mirrors the body `code`
+// (entitlement-check.ts getBillingVerificationDenial / gateway wm_-key branch),
+// so every ForbiddenError-backed 403 on an authed op declares the header as
+// optional. The public Turnstile 403 gates never carry it.
+const LAPSE_403_HEADERS = {
+  'X-Billing-Verification': {
+    description: `Present when the 403 is a billing-provider-confirmed subscription lapse (value ${LAPSED_BILLING_STATUS}, matching the body \`code\`).`,
+    schema: { type: 'string' },
+  },
+};
+
 const FORBIDDEN_RESPONSE = {
   description: 'PRO entitlement access denied.',
+  headers: LAPSE_403_HEADERS,
   content: {
     'application/json': {
       schema: { $ref: '#/components/schemas/ForbiddenError' },
@@ -194,6 +257,7 @@ const PREMIUM_FORBIDDEN_NOTE = 'PRO-gated. Requires an active Pro subscription.'
 
 const PREMIUM_FORBIDDEN_RESPONSE = {
   description: 'Pro subscription required.',
+  headers: LAPSE_403_HEADERS,
   content: {
     'application/json': {
       schema: { $ref: '#/components/schemas/ForbiddenError' },
@@ -209,6 +273,7 @@ const PREMIUM_FORBIDDEN_RESPONSE = {
 // authed ops that carry no more-specific 403. Reuses ForbiddenError ({ error }).
 const INACTIVE_ACCESS_FORBIDDEN_RESPONSE = {
   description: 'API access requires an active subscription (the API key\'s subscription is inactive or expired).',
+  headers: LAPSE_403_HEADERS,
   content: {
     'application/json': {
       schema: { $ref: '#/components/schemas/ForbiddenError' },
@@ -245,7 +310,11 @@ function injectJson(spec) {
   spec.components.schemas ||= {};
 
   const hasBearerAuthPath = Object.keys(spec.paths ?? {}).some((path) => BEARER_AUTH_PATHS.has(path));
-  const expectedSecuritySchemes = hasBearerAuthPath ? SECURITY_SCHEMES : API_KEY_SECURITY_SCHEMES;
+  const hasTrustReviewPath = Object.keys(spec.paths ?? {}).some((path) => TRUST_REVIEW_KEY_PATHS.has(path));
+  const expectedSecuritySchemes = {
+    ...(hasBearerAuthPath ? SECURITY_SCHEMES : API_KEY_SECURITY_SCHEMES),
+    ...(hasTrustReviewPath ? TRUST_REVIEW_SECURITY_SCHEMES : {}),
+  };
   if (!eq(spec.components.securitySchemes, expectedSecuritySchemes)) {
     spec.components.securitySchemes = expectedSecuritySchemes;
     changed = true;
@@ -279,7 +348,18 @@ function injectJson(spec) {
     for (const [method, op] of Object.entries(ops)) {
       if (!HTTP_METHODS.has(method) || !op || typeof op !== 'object') continue;
       op.responses ||= {};
-      if (isPublic) {
+      if (TRUST_REVIEW_KEY_PATHS.has(path)) {
+        // Public at the gateway, but the handler 401s without the review key.
+        if (!eq(op.security, TRUST_REVIEW_OPERATION_SECURITY)) {
+          op.security = TRUST_REVIEW_OPERATION_SECURITY;
+          changed = true;
+        }
+        if (!eq(op.responses['401'], TRUST_REVIEW_UNAUTHORIZED_RESPONSE)) {
+          op.responses['401'] = TRUST_REVIEW_UNAUTHORIZED_RESPONSE;
+          changed = true;
+        }
+        if (op.responses['403'] !== undefined) { delete op.responses['403']; changed = true; }
+      } else if (isPublic) {
         // Public RPC: override the root requirement with an empty security
         // (marks the operation as unauthenticated) and carry no 401-for-missing-key.
         if (!eq(op.security, [])) { op.security = []; changed = true; }
@@ -294,19 +374,24 @@ function injectJson(spec) {
             op.responses['403'] = publicForbiddenGate.response;
             changed = true;
           }
+        } else if (op.responses['403'] !== undefined) {
+          delete op.responses['403'];
+          changed = true;
         }
       } else {
         if (BEARER_AUTH_PATHS.has(path)) {
-          if (!eq(op.security, BEARER_OPERATION_SECURITY)) {
-            op.security = BEARER_OPERATION_SECURITY;
+          const security = path === COUNTRY_HISTORY_PATH ? OPTIONAL_HISTORY_SECURITY : BEARER_OPERATION_SECURITY;
+          if (!eq(op.security, security)) {
+            op.security = security;
             changed = true;
           }
         } else if (op.security !== undefined) {
           delete op.security;
           changed = true;
         }
-        if (!eq(op.responses['401'], UNAUTHORIZED_RESPONSE)) {
-          op.responses['401'] = UNAUTHORIZED_RESPONSE;
+        const unauthorized = path === COUNTRY_HISTORY_PATH ? OPTIONAL_HISTORY_UNAUTHORIZED_RESPONSE : UNAUTHORIZED_RESPONSE;
+        if (!eq(op.responses['401'], unauthorized)) {
+          op.responses['401'] = unauthorized;
           changed = true;
         }
         if (isEntitlementGated) {
@@ -361,7 +446,7 @@ function yamlRootSecurityBlock() {
   ].join('\n');
 }
 
-function yamlSecuritySchemesBlock(hasBearer) {
+function yamlSecuritySchemesBlock(hasBearer, hasTrustReview) {
   // Child of top-level `components:` — 4-space key, 8-space scheme names,
   // 12-space fields. BearerAuth is appended only when the artifact has a
   // bearer-capable operation, mirroring expectedSchemesForSpec in the JSON path.
@@ -384,6 +469,15 @@ function yamlSecuritySchemesBlock(hasBearer) {
       '            type: http',
       '            scheme: bearer',
       "            description: 'Bearer token: a Clerk-issued JWT for browser session flows, passed as Authorization: Bearer <token>.'",
+    );
+  }
+  if (hasTrustReview) {
+    L.push(
+      '        TrustReviewKey:',
+      '            type: apiKey',
+      '            in: header',
+      '            name: X-Trust-Review-Key',
+      `            description: ${TRUST_REVIEW_SECURITY_SCHEMES.TrustReviewKey.description}`,
     );
   }
   return L.join('\n');
@@ -437,8 +531,8 @@ function ensureYamlRootSecurity(lines) {
   return true;
 }
 
-function ensureYamlSecuritySchemes(lines, hasBearer) {
-  const expected = yamlSecuritySchemesBlock(hasBearer);
+function ensureYamlSecuritySchemes(lines, hasBearer, hasTrustReview) {
+  const expected = yamlSecuritySchemesBlock(hasBearer, hasTrustReview);
   const { componentsIndex, block } = findComponentsChildBlock(lines, 'securitySchemes');
   if (componentsIndex === -1) {
     throw new Error('yaml: could not find top-level `components:` anchor for securitySchemes block');
@@ -456,9 +550,18 @@ function ensureYamlSecuritySchemes(lines, hasBearer) {
 // ── Service/bundle YAML entitlement insertion (formatting-preserving) ────────
 const YAML_METHOD_LINE_RE = /^ {8}(get|post|put|delete|patch|options|head):$/;
 
+const YAML_LAPSE_403_HEADERS = [
+  '                    headers:',
+  '                        X-Billing-Verification:',
+  `                            description: Present when the 403 is a billing-provider-confirmed subscription lapse (value ${LAPSED_BILLING_STATUS}, matching the body \`code\`).`,
+  '                            schema:',
+  '                                type: string',
+];
+
 const YAML_FORBIDDEN_RESPONSE = [
   '                "403":',
   '                    description: PRO entitlement access denied.',
+  ...YAML_LAPSE_403_HEADERS,
   '                    content:',
   '                        application/json:',
   '                            schema:',
@@ -481,6 +584,7 @@ function yamlPublicForbiddenResponse(gate) {
 const YAML_PREMIUM_FORBIDDEN_RESPONSE = [
   '                "403":',
   '                    description: Pro subscription required.',
+  ...YAML_LAPSE_403_HEADERS,
   '                    content:',
   '                        application/json:',
   '                            schema:',
@@ -490,6 +594,7 @@ const YAML_PREMIUM_FORBIDDEN_RESPONSE = [
 const YAML_INACTIVE_ACCESS_FORBIDDEN_RESPONSE = [
   '                "403":',
   "                    description: API access requires an active subscription (the API key's subscription is inactive or expired).",
+  ...YAML_LAPSE_403_HEADERS,
   '                    content:',
   '                        application/json:',
   '                            schema:',
@@ -503,6 +608,11 @@ const YAML_FORBIDDEN_SCHEMA = [
   '                error:',
   '                    type: string',
   '                    description: Human-readable entitlement failure reason.',
+  '                code:',
+  '                    type: string',
+  '                    enum:',
+  `                        - ${LAPSED_BILLING_STATUS}`,
+  '                    description: Machine-readable denial code, present when the 403 is a billing-provider-confirmed subscription lapse (mirrored in the X-Billing-Verification response header).',
   '                requiredTier:',
   '                    type: integer',
   '                    format: int32',
@@ -528,6 +638,15 @@ const YAML_UNAUTHORIZED_RESPONSE = [
   "                                $ref: '#/components/schemas/UnauthorizedError'",
 ];
 
+const YAML_TRUST_REVIEW_UNAUTHORIZED_RESPONSE = [
+  '                "401":',
+  `                    description: ${TRUST_REVIEW_UNAUTHORIZED_RESPONSE.description}`,
+  '                    content:',
+  '                        application/json:',
+  '                            schema:',
+  "                                $ref: '#/components/schemas/Error'",
+];
+
 const YAML_UNAUTHORIZED_SCHEMA = [
   '        UnauthorizedError:',
   '            type: object',
@@ -547,6 +666,18 @@ const YAML_BEARER_OPERATION_SECURITY = [
   '                - ApiKeyHeader: []',
   '                - BearerAuth: []',
 ];
+
+const YAML_TRUST_REVIEW_OPERATION_SECURITY = [
+  '            security:',
+  '                - TrustReviewKey: []',
+];
+
+const YAML_OPERATION_SECURITY = {
+  public: ['            security: []'],
+  bearer: YAML_BEARER_OPERATION_SECURITY,
+  'optional-history': [YAML_BEARER_OPERATION_SECURITY[0], '                - {}', ...YAML_BEARER_OPERATION_SECURITY.slice(1)],
+  'trust-review': YAML_TRUST_REVIEW_OPERATION_SECURITY,
+};
 
 function findYamlPathRange(lines, path) {
   const start = lines.indexOf(`    ${path}:`);
@@ -891,15 +1022,15 @@ function findYamlOperationRangeForMethod(lines, path, method) {
   return { start: methodIndex, end };
 }
 
-function ensureYamlUnauthorizedResponse(lines, path, method) {
+function ensureYamlUnauthorizedResponse(lines, path, method, responseLines = YAML_UNAUTHORIZED_RESPONSE) {
   const op = findYamlOperationRangeForMethod(lines, path, method);
   if (!op) return false;
 
-  const expected = YAML_UNAUTHORIZED_RESPONSE.join('\n');
+  const expected = responseLines.join('\n');
   const existing = findYamlResponseRange(lines, op, '                "401":');
   if (existing) {
     if (existing.text === expected) return false;
-    lines.splice(existing.start, existing.end - existing.start, ...YAML_UNAUTHORIZED_RESPONSE);
+    lines.splice(existing.start, existing.end - existing.start, ...responseLines);
     return true;
   }
 
@@ -929,7 +1060,7 @@ function ensureYamlUnauthorizedResponse(lines, path, method) {
   const insertAt = forbiddenIndex !== -1
     ? forbiddenIndex
     : (defaultIndex === -1 ? responseEnd : defaultIndex);
-  lines.splice(insertAt, 0, ...YAML_UNAUTHORIZED_RESPONSE);
+  lines.splice(insertAt, 0, ...responseLines);
   return true;
 }
 
@@ -950,11 +1081,12 @@ function findYamlOperationSecurityRange(lines, op) {
   return { start, end };
 }
 
-// kind: 'public' → `security: []` (opt out); 'bearer' → API-key + BearerAuth list.
+// kind: 'public' → `security: []` (opt out); 'bearer' → API-key + BearerAuth
+// list; 'trust-review' → the review key alone.
 function ensureYamlOperationSecurity(lines, path, method, kind) {
   const op = findYamlOperationRangeForMethod(lines, path, method);
   if (!op) return false;
-  const desired = kind === 'public' ? ['            security: []'] : YAML_BEARER_OPERATION_SECURITY;
+  const desired = YAML_OPERATION_SECURITY[kind];
 
   const existing = findYamlOperationSecurityRange(lines, op);
   if (existing) {
@@ -997,6 +1129,18 @@ function removeYamlUnauthorizedResponse(lines, path, method) {
   return true;
 }
 
+// Public operations without an explicit PUBLIC_FORBIDDEN_GATES entry cannot
+// reach the authenticated account-state 403. Remove stale generated 403s when
+// a route moves into PUBLIC_NO_AUTH_RPC_PATHS.
+function removeYamlForbiddenResponse(lines, path, method) {
+  const op = findYamlOperationRangeForMethod(lines, path, method);
+  if (!op) return false;
+  const existing = findYamlResponseRange(lines, op, '                "403":');
+  if (!existing) return false;
+  lines.splice(existing.start, existing.end - existing.start);
+  return true;
+}
+
 // Enumerate operations by text scan (no YAML parser): a path is a 4-space key
 // beginning with `/`; its methods are the 8-space HTTP-verb keys inside the
 // path block (which ends at the next path or any shallower-indented line,
@@ -1019,34 +1163,46 @@ function enumerateYamlOperations(lines) {
 }
 
 // Full auth contract for a YAML artifact (per-service YAML or the bundle),
-// mirroring injectJson: top-level securitySchemes (2 or 3 by bearer-path
-// presence) + root API-key security + UnauthorizedError schema + per-operation
-// 401 / public security:[] opt-outs / bearer stamping.
+// mirroring injectJson: top-level securitySchemes (API key, plus BearerAuth and
+// TrustReviewKey by path presence) + root API-key security + UnauthorizedError
+// schema + per-operation 401 / public security:[] opt-outs / bearer and
+// review-key stamping.
 function injectYamlAuthContract(text) {
   const lines = text.split('\n');
   let changed = false;
 
   const operations = enumerateYamlOperations(lines);
   const hasBearer = operations.some(({ path }) => BEARER_AUTH_PATHS.has(path));
+  const hasTrustReview = operations.some(({ path }) => TRUST_REVIEW_KEY_PATHS.has(path));
   // Mirror injectJson: only inject UnauthorizedError when a non-public op
   // (which carries the 401 that references it) exists — otherwise it is orphaned.
   const hasNonPublicOp = operations.some(({ path }) => !PUBLIC_PATHS.has(path));
 
   changed = ensureYamlRootSecurity(lines) || changed;
-  changed = ensureYamlSecuritySchemes(lines, hasBearer) || changed;
+  changed = ensureYamlSecuritySchemes(lines, hasBearer, hasTrustReview) || changed;
   if (hasNonPublicOp) changed = ensureYamlUnauthorizedSchema(lines) || changed;
 
   for (const { path, methods } of operations) {
     for (const method of methods) {
-      if (PUBLIC_PATHS.has(path)) {
+      if (TRUST_REVIEW_KEY_PATHS.has(path)) {
+        changed = ensureYamlOperationSecurity(lines, path, method, 'trust-review') || changed;
+        changed = ensureYamlUnauthorizedResponse(lines, path, method, YAML_TRUST_REVIEW_UNAUTHORIZED_RESPONSE) || changed;
+        changed = removeYamlForbiddenResponse(lines, path, method) || changed;
+      } else if (PUBLIC_PATHS.has(path)) {
         // Public RPC: opt out of the root requirement, carry no 401. Drop any
         // stale 401 left over from when the path was authenticated.
         changed = ensureYamlOperationSecurity(lines, path, method, 'public') || changed;
         changed = removeYamlUnauthorizedResponse(lines, path, method) || changed;
+        if (!PUBLIC_FORBIDDEN_GATES.has(path)) {
+          changed = removeYamlForbiddenResponse(lines, path, method) || changed;
+        }
       } else {
-        changed = ensureYamlUnauthorizedResponse(lines, path, method) || changed;
+        const unauthorized = path === COUNTRY_HISTORY_PATH
+          ? YAML_UNAUTHORIZED_RESPONSE.map(line => line.replace(UNAUTHORIZED_RESPONSE.description, OPTIONAL_HISTORY_UNAUTHORIZED_RESPONSE.description))
+          : YAML_UNAUTHORIZED_RESPONSE;
+        changed = ensureYamlUnauthorizedResponse(lines, path, method, unauthorized) || changed;
         if (BEARER_AUTH_PATHS.has(path)) {
-          changed = ensureYamlOperationSecurity(lines, path, method, 'bearer') || changed;
+          changed = ensureYamlOperationSecurity(lines, path, method, path === COUNTRY_HISTORY_PATH ? 'optional-history' : 'bearer') || changed;
         } else {
           // Non-bearer op inherits the root API-key requirement; strip any
           // stale operation-level security (e.g. a BearerAuth block left from

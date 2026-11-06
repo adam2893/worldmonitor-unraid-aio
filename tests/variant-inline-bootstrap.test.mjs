@@ -1,3 +1,8 @@
+// Committed-HTML contract by design (#8690, section 2): this suite pins
+// variant-host declarations and the inline script's CSP hash in vercel.json.
+// Runtime module tests do not check the committed HTML and header policy
+// that the browser reads before those modules run.
+//
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -9,7 +14,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const indexHtml = readFileSync(resolve(__dirname, '../index.html'), 'utf-8');
 const vercelConfig = JSON.parse(readFileSync(resolve(__dirname, '../vercel.json'), 'utf-8'));
 const csp = vercelConfig.headers
-  .find((entry) => entry.source === '/((?!docs|embed|embed\\.html).*)')
+  .find((entry) => entry.headers?.some(
+    (header) => header.key === 'X-Frame-Options' && header.value === 'SAMEORIGIN',
+  ))
   ?.headers
   ?.find((header) => header.key === 'Content-Security-Policy')
   ?.value ?? '';

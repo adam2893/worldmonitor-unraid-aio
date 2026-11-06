@@ -6,11 +6,15 @@ import { fileURLToPath } from 'node:url';
 import {
   parseEmberCsv,
   buildAllCountriesMap,
+  getPipelineFailures,
+  isEmberCountDrop,
+  preservePreviousSnapshot,
   EMBER_KEY_PREFIX,
   EMBER_ALL_KEY,
   EMBER_META_KEY,
   EMBER_TTL_SECONDS,
 } from '../scripts/seed-ember-electricity.mjs';
+import { createRedisFetch } from './helpers/fake-upstash-redis.mts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_DIR = resolve(__dirname, 'fixtures');
@@ -20,28 +24,26 @@ const FIXTURE_DIR = resolve(__dirname, 'fixtures');
 // Real Ember CSV column names (must match COLS in seed-ember-electricity.mjs)
 const ISO3_COL = 'ISO 3 code';
 const DATE_COL = 'Date';
-const SERIES_COL = 'Variable';
-const UNIT_COL = 'Unit';
-const VALUE_COL = 'Value';
+const SERIES_COL = 'Electricity source';
+const VALUE_COL = 'Generation (TWh)';
 
 function makeRow(overrides = {}) {
   return {
     [ISO3_COL]: 'USA',
     [DATE_COL]: '2024-01-01',
     [SERIES_COL]: 'Coal',
-    [UNIT_COL]: 'TWh',
     [VALUE_COL]: '100',
     ...overrides,
   };
 }
 
 /**
- * Build a minimal long-format CSV string from an array of row objects.
+ * Build a minimal Ember monthly release CSV string from an array of row objects.
  * @param {Array<Record<string, string>>} rows
  * @param {string} [eol] line terminator (default LF). Upstream switched to bare CR in June 2026.
  */
 function buildCsv(rows, eol = '\n') {
-  const headers = [ISO3_COL, DATE_COL, SERIES_COL, UNIT_COL, VALUE_COL, 'Category'];
+  const headers = [ISO3_COL, DATE_COL, SERIES_COL, VALUE_COL];
   const lines = [headers.join(',')];
   for (const row of rows) {
     lines.push(headers.map((h) => row[h] ?? '').join(','));
@@ -60,28 +62,94 @@ function threeCountryFixture() {
     makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Nuclear',          [VALUE_COL]: '100' }),
     makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Coal',             [VALUE_COL]: '200' }),
     makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Gas',              [VALUE_COL]: '200' }),
-    makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Total Generation', [VALUE_COL]: '800' }),
+    makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Total generation', [VALUE_COL]: '800' }),
     // DEU (Germany)
     makeRow({ [ISO3_COL]: 'DEU', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Fossil',           [VALUE_COL]: '200' }),
     makeRow({ [ISO3_COL]: 'DEU', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Renewables',       [VALUE_COL]: '500' }),
     makeRow({ [ISO3_COL]: 'DEU', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Nuclear',          [VALUE_COL]: '0'   }),
     makeRow({ [ISO3_COL]: 'DEU', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Coal',             [VALUE_COL]: '100' }),
     makeRow({ [ISO3_COL]: 'DEU', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Gas',              [VALUE_COL]: '100' }),
-    makeRow({ [ISO3_COL]: 'DEU', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Total Generation', [VALUE_COL]: '700' }),
+    makeRow({ [ISO3_COL]: 'DEU', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Total generation', [VALUE_COL]: '700' }),
     // FRA (France)
     makeRow({ [ISO3_COL]: 'FRA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Fossil',           [VALUE_COL]: '50'  }),
     makeRow({ [ISO3_COL]: 'FRA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Renewables',       [VALUE_COL]: '100' }),
     makeRow({ [ISO3_COL]: 'FRA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Nuclear',          [VALUE_COL]: '400' }),
     makeRow({ [ISO3_COL]: 'FRA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Coal',             [VALUE_COL]: '20'  }),
     makeRow({ [ISO3_COL]: 'FRA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Gas',              [VALUE_COL]: '30'  }),
-    makeRow({ [ISO3_COL]: 'FRA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Total Generation', [VALUE_COL]: '550' }),
+    makeRow({ [ISO3_COL]: 'FRA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Total generation', [VALUE_COL]: '550' }),
   ];
   return buildCsv(rows);
 }
 
+function mockEmberRedis(t, existingMeta) {
+  process.env.UPSTASH_REDIS_REST_URL = 'https://redis.ember.test';
+  process.env.UPSTASH_REDIS_REST_TOKEN = 'test-token';
+  const { fetchImpl } = createRedisFetch(existingMeta == null ? {} : {
+    [EMBER_META_KEY]: existingMeta,
+  });
+  const pipelines = [];
+
+  t.mock.method(console, 'error', () => {});
+  t.mock.method(globalThis, 'fetch', async (input, init = {}) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (new URL(url).pathname === '/pipeline') {
+      pipelines.push(JSON.parse(String(init.body)));
+    }
+    return fetchImpl(input, init);
+  });
+
+  return pipelines;
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
+describe('parseEmberCsv on the November 2026 release file', () => {
+  // Rows for USA, DEU and FRA cut from
+  // files.ember-energy.org/.../release_generation_monthly_global.csv on
+  // 2026-11-03, after Ember retired monthly_full_release_long_format.csv.
+  // Expected shares are Ember's own "Share of generation (%)" column.
+  const csv = readFileSync(
+    new URL('./fixtures/ember/release_generation_monthly_global.excerpt.csv', import.meta.url),
+    'utf8',
+  );
+
+  it('reads the latest month for each country', () => {
+    const result = parseEmberCsv(csv);
+    assert.deepEqual([...result.keys()].sort(), ['DE', 'FR', 'US']);
+    for (const entry of result.values()) assert.equal(entry.dataMonth, '2026-09');
+  });
+
+  it('matches the shares Ember publishes', () => {
+    const result = parseEmberCsv(csv);
+    const expected = {
+      US: { fossilShare: 60.278, renewShare: 23.63, nuclearShare: 16.092, coalShare: 15.715, gasShare: 44.062, demandTwh: 406.044 },
+      DE: { fossilShare: 38.181, renewShare: 61.819, nuclearShare: 0, coalShare: 19.973, gasShare: 13.127, demandTwh: 42.042 },
+      FR: { fossilShare: 4.116, renewShare: 24.078, nuclearShare: 71.806, coalShare: 0, gasShare: 3.179, demandTwh: 36.082 },
+    };
+    for (const [iso2, fields] of Object.entries(expected)) {
+      for (const [field, value] of Object.entries(fields)) {
+        assert.ok(Math.abs(result.get(iso2)[field] - value) < 0.01, `${iso2} ${field} ${result.get(iso2)[field]} vs ${value}`);
+      }
+    }
+  });
+});
+
 describe('parseEmberCsv', () => {
+  it('rejects a CSV missing any mapped Ember column', () => {
+    const [header, ...rows] = threeCountryFixture().split('\n');
+    const headers = header.split(',');
+    const dateIndex = headers.indexOf(DATE_COL);
+    const withoutDate = [
+      headers.filter((_, index) => index !== dateIndex).join(','),
+      ...rows.map((row) => row.split(',').filter((_, index) => index !== dateIndex).join(',')),
+    ].join('\n');
+
+    assert.throws(
+      () => parseEmberCsv(withoutDate),
+      /missing mapped columns: Date/,
+    );
+  });
+
   it('parses a minimal 3-country fixture', () => {
     const csv = threeCountryFixture();
     const result = parseEmberCsv(csv);
@@ -125,10 +193,10 @@ describe('parseEmberCsv', () => {
     const rows = [
       // Jan 2024
       makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Fossil',           [VALUE_COL]: '100' }),
-      makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Total Generation', [VALUE_COL]: '200' }),
+      makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Total generation', [VALUE_COL]: '200' }),
       // Feb 2024 (later — should be selected)
       makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '2024-02-01', [SERIES_COL]: 'Fossil',           [VALUE_COL]: '80'  }),
-      makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '2024-02-01', [SERIES_COL]: 'Total Generation', [VALUE_COL]: '210' }),
+      makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '2024-02-01', [SERIES_COL]: 'Total generation', [VALUE_COL]: '210' }),
     ];
     const csv = buildCsv(rows);
     const result = parseEmberCsv(csv);
@@ -137,17 +205,6 @@ describe('parseEmberCsv', () => {
     assert.equal(gb.dataMonth, '2024-02', 'should use the later month');
     // Feb: fossil=80, total=210 → ~38.1%
     assert.ok(Math.abs(gb.fossilShare - (80 / 210) * 100) < 0.01);
-  });
-
-  it('skips rows where unit !== TWh', () => {
-    const rows = [
-      makeRow({ [ISO3_COL]: 'AUS', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Fossil',           [UNIT_COL]: 'GW', [VALUE_COL]: '100' }),
-      makeRow({ [ISO3_COL]: 'AUS', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Total Generation', [UNIT_COL]: 'GW', [VALUE_COL]: '200' }),
-    ];
-    const csv = buildCsv(rows);
-    const result = parseEmberCsv(csv);
-    // AUS should not appear since no TWh rows
-    assert.ok(!result.has('AU'), 'AU should be excluded when unit is GW');
   });
 
   it('skips countries where Total Generation is missing', () => {
@@ -187,7 +244,7 @@ describe('upstream date-format change (DD/MM/YYYY)', () => {
   it('extracts dataMonth from DD/MM/YYYY dates', () => {
     const rows = [
       makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '01/03/2026', [SERIES_COL]: 'Fossil',           [VALUE_COL]: '400' }),
-      makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '01/03/2026', [SERIES_COL]: 'Total Generation', [VALUE_COL]: '800' }),
+      makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '01/03/2026', [SERIES_COL]: 'Total generation', [VALUE_COL]: '800' }),
     ];
     const result = parseEmberCsv(buildCsv(rows));
     const us = result.get('US');
@@ -199,9 +256,9 @@ describe('upstream date-format change (DD/MM/YYYY)', () => {
     // Lexically "01/12/2025" > "01/01/2026", so naive string max picks the wrong (older) month.
     const rows = [
       makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '01/12/2025', [SERIES_COL]: 'Fossil',           [VALUE_COL]: '100' }),
-      makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '01/12/2025', [SERIES_COL]: 'Total Generation', [VALUE_COL]: '200' }),
+      makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '01/12/2025', [SERIES_COL]: 'Total generation', [VALUE_COL]: '200' }),
       makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '01/01/2026', [SERIES_COL]: 'Fossil',           [VALUE_COL]: '80'  }),
-      makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '01/01/2026', [SERIES_COL]: 'Total Generation', [VALUE_COL]: '210' }),
+      makeRow({ [ISO3_COL]: 'GBR', [DATE_COL]: '01/01/2026', [SERIES_COL]: 'Total generation', [VALUE_COL]: '210' }),
     ];
     const result = parseEmberCsv(buildCsv(rows));
     const gb = result.get('GB');
@@ -220,7 +277,7 @@ describe('real-world combined format (CR-only + DD/MM/YYYY)', () => {
   it('parses a CSV with both June-2026 upstream changes at once', () => {
     const rows = [
       makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '01/04/2026', [SERIES_COL]: 'Fossil',           [VALUE_COL]: '400' }),
-      makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '01/04/2026', [SERIES_COL]: 'Total Generation', [VALUE_COL]: '800' }),
+      makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '01/04/2026', [SERIES_COL]: 'Total generation', [VALUE_COL]: '800' }),
     ];
     const csv = buildCsv(rows, '\r'); // CR-only + DD/MM/YYYY
     const result = parseEmberCsv(csv);
@@ -235,7 +292,7 @@ describe('schema sentinel', () => {
   it('throws when Fossil series is not present in any row', () => {
     const rows = [
       makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Coal',             [VALUE_COL]: '100' }),
-      makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Total Generation', [VALUE_COL]: '200' }),
+      makeRow({ [ISO3_COL]: 'USA', [DATE_COL]: '2024-01-01', [SERIES_COL]: 'Total generation', [VALUE_COL]: '200' }),
     ];
     const csv = buildCsv(rows);
     assert.throws(
@@ -295,36 +352,30 @@ describe('exported constants', () => {
 
 describe('count-drop guard math', () => {
   it('45/60 is acceptable (75% threshold)', () => {
-    const prevCount = 60;
-    const newCount = 45;
-    const ratio = newCount / prevCount;
-    assert.ok(ratio >= 0.75, '45/60 = 75% should pass the guard');
+    assert.equal(isEmberCountDrop(45, { recordCount: 60 }), false);
   });
 
   it('44/60 triggers the guard (below 75%)', () => {
-    const prevCount = 60;
-    const newCount = 44;
-    const ratio = newCount / prevCount;
-    assert.ok(ratio < 0.75, '44/60 ≈ 73.3% should trigger the guard');
+    assert.equal(isEmberCountDrop(44, { recordCount: 60 }), true);
   });
 });
 
 describe('pipeline failure detection logic (non-transactional, e.g. Phase B meta write)', () => {
   it('detects a partial pipeline failure when one command errors', () => {
     const results = [{ result: 'OK' }, { result: 'OK' }, { error: 'NOSCRIPT' }, { result: 'OK' }];
-    const failures = results.filter((r) => r?.error || r?.result === 'ERR');
+    const failures = getPipelineFailures(results);
     assert.equal(failures.length, 1, 'should detect 1 failed command');
   });
 
   it('treats all-OK results as no failures', () => {
     const results = [{ result: 'OK' }, { result: 'OK' }, { result: 'OK' }];
-    const failures = results.filter((r) => r?.error || r?.result === 'ERR');
+    const failures = getPipelineFailures(results);
     assert.equal(failures.length, 0, 'all-OK pipeline should have 0 failures');
   });
 
   it('detects ERR-result commands as failures', () => {
     const results = [{ result: 'OK' }, { result: 'ERR' }];
-    const failures = results.filter((r) => r?.error || r?.result === 'ERR');
+    const failures = getPipelineFailures(results);
     assert.equal(failures.length, 1, 'ERR result should count as failure');
   });
 });
@@ -526,79 +577,63 @@ describe('health cascade: seedError priority over hasData', () => {
   });
 });
 
-describe('health endpoint status agreement for error meta', () => {
-  it('seed-health.js logic emits "error" for meta.status="error"', () => {
-    // Simulates seed-health.js lines 131-148 logic
-    const meta = { fetchedAt: Date.now(), recordCount: 100, status: 'error', error: 'test failure' };
-    const isError = meta.status === 'error';
-    const ageMs = Date.now() - (meta.fetchedAt || 0);
-    const maxStalenessMs = 1440 * 2 * 60 * 1000;
-    const stale = ageMs > maxStalenessMs || isError;
-    const status = stale ? (isError ? 'error' : 'stale') : 'ok';
-    assert.equal(status, 'error', 'seed-health.js should report "error" for meta.status=error');
-  });
-
-  it('health.js SEED_ERROR is the correct status for meta.status="error" (not STALE_SEED)', () => {
-    // Verifies the expected contract: meta.status=error → SEED_ERROR (not STALE_SEED)
-    // This test documents the intended behavior after the fix
-    const meta = { fetchedAt: Date.now(), recordCount: 100, status: 'error', error: 'test failure' };
-    const seedError = meta?.status === 'error';
-    const seedStale = seedError; // error implies stale
-
-    let status;
-    if (seedError) {
-      status = 'SEED_ERROR';
-    } else if (seedStale) {
-      status = 'STALE_SEED';
-    } else {
-      status = 'OK';
-    }
-    assert.equal(status, 'SEED_ERROR', 'explicit error meta should yield SEED_ERROR, not STALE_SEED');
-  });
-});
-
 describe('preservePreviousSnapshot recordCount fallback', () => {
-  it('uses null (not 0) when existingMeta is unavailable', () => {
-    const existingMeta = null;
-    const recordCount = existingMeta?.recordCount ?? null;
-    assert.equal(recordCount, null, 'should be null, not 0');
-    const serialized = JSON.stringify({ recordCount });
-    assert.ok(serialized.includes('"recordCount":null'), 'null should be serialized');
+  it('uses null (not 0) when existingMeta is unavailable', async (t) => {
+    const pipelines = mockEmberRedis(t, null);
+
+    await preservePreviousSnapshot('test failure', null, null, true);
+
+    const [[metaCommand]] = pipelines;
+    const meta = JSON.parse(metaCommand[2]);
+    assert.equal(meta.recordCount, null, 'should publish null, not 0');
   });
 
-  it('preserves existing recordCount when meta is readable', () => {
-    const existingMeta = { recordCount: 180, fetchedAt: Date.now() };
-    const recordCount = existingMeta?.recordCount ?? null;
-    assert.equal(recordCount, 180);
+  it('preserves existing recordCount when meta is readable', async (t) => {
+    const pipelines = mockEmberRedis(t, { recordCount: 180, fetchedAt: Date.now() });
+
+    await preservePreviousSnapshot('test failure', null, null, true);
+
+    const [[metaCommand]] = pipelines;
+    const meta = JSON.parse(metaCommand[2]);
+    assert.equal(meta.recordCount, 180);
   });
 
   it('null recordCount does not enable count-drop guard', () => {
-    const prevMeta = { recordCount: null, status: 'error' };
-    const guardActive = prevMeta && typeof prevMeta === 'object' && prevMeta.recordCount > 0;
-    assert.equal(guardActive, false, 'null recordCount should not activate guard');
+    assert.equal(
+      isEmberCountDrop(44, { recordCount: null, status: 'error' }),
+      false,
+      'null recordCount should not activate guard',
+    );
   });
 });
 
 describe('dataWritten flag prevents stash restore after successful pipeline', () => {
-  it('skips restore when dataWritten=true (data is correct, only meta failed)', () => {
+  it('skips restore when dataWritten=true (data is correct, only meta failed)', async (t) => {
     const stashedAllMap = { US: {}, DE: {} };
-    const dataWritten = true;
-    const shouldRestore = stashedAllMap && typeof stashedAllMap === 'object' && !dataWritten;
-    assert.equal(shouldRestore, false, 'should not restore stash when data was written successfully');
+    const pipelines = mockEmberRedis(t, { recordCount: 180 });
+
+    await preservePreviousSnapshot('metadata failed', stashedAllMap, new Set(['US', 'DE']), true);
+
+    assert.equal(pipelines.length, 1, 'only the error metadata pipeline should run');
+    assert.equal(pipelines[0][0][1], EMBER_META_KEY);
   });
 
-  it('allows restore when dataWritten=false (pipeline failed or never ran)', () => {
+  it('allows restore when dataWritten=false (pipeline failed or never ran)', async (t) => {
     const stashedAllMap = { US: {}, DE: {} };
-    const dataWritten = false;
-    const shouldRestore = stashedAllMap && typeof stashedAllMap === 'object' && !dataWritten;
-    assert.ok(shouldRestore, 'should restore stash when data was not written');
-  });
+    const pipelines = mockEmberRedis(t, { recordCount: 180 });
 
-  it('skips TTL extension when dataWritten=true and no stash', () => {
-    const stashedAllMap = null;
-    const dataWritten = true;
-    const shouldExtendTtl = !dataWritten;
-    assert.equal(shouldExtendTtl, false, 'should not extend TTL when data is already correct');
+    await preservePreviousSnapshot('data pipeline failed', stashedAllMap, new Set(['US', 'DE', 'XX']), false);
+
+    assert.equal(pipelines.length, 2, 'restore and error metadata pipelines should run');
+    assert.deepEqual(
+      pipelines[0].map((command) => command.slice(0, 2)),
+      [
+        ['SET', `${EMBER_KEY_PREFIX}US`],
+        ['SET', `${EMBER_KEY_PREFIX}DE`],
+        ['SET', EMBER_ALL_KEY],
+        ['DEL', `${EMBER_KEY_PREFIX}XX`],
+      ],
+    );
   });
 });
 
@@ -607,7 +642,7 @@ describe('dataWritten flag prevents stash restore after successful pipeline', ()
 // ---------------------------------------------------------------------------
 
 describe('golden fixture (Ember monthly CSV)', () => {
-  const csv = readFileSync(resolve(FIXTURE_DIR, 'ember-monthly-sample.csv'), 'utf-8');
+  const csv = readFileSync(resolve(FIXTURE_DIR, 'ember/release_generation_monthly_global.excerpt.csv'), 'utf-8');
 
   it('parseEmberCsv returns at least 1 country from the fixture', () => {
     const countries = parseEmberCsv(csv);
@@ -645,12 +680,5 @@ describe('golden fixture (Ember monthly CSV)', () => {
     for (const [iso2, entry] of countries) {
       assert.match(entry.dataMonth, /^\d{4}-\d{2}$/, `${iso2} dataMonth format wrong: ${entry.dataMonth}`);
     }
-  });
-
-  it('US fossilShare is 50% (400/800)', () => {
-    const countries = parseEmberCsv(csv);
-    const us = countries.get('US');
-    assert.ok(us != null);
-    assert.ok(Math.abs(us.fossilShare - 50) < 0.01, `US fossilShare should be 50, got ${us.fossilShare}`);
   });
 });

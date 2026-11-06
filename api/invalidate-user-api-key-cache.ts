@@ -36,7 +36,7 @@ export default async function handler(
   }
 
   if (req.method !== 'POST') {
-    return jsonResponse({ error: 'Method not allowed' }, 405, cors);
+    return jsonResponse({ error: 'Method not allowed' }, 405, { ...cors, Allow: 'POST, OPTIONS' });
   }
 
   const authHeader = req.headers.get('Authorization') ?? '';
@@ -98,6 +98,7 @@ export default async function handler(
     console.warn('[invalidate-cache] Ownership check failed:', err instanceof Error ? err.message : String(err));
     captureSilentError(err, {
       tags: { route: 'api/invalidate-user-api-key-cache', step: 'ownership-check' },
+      fingerprint: ['api/invalidate-user-api-key-cache', 'ownership-check', err instanceof Error ? err.name : 'Error'],
       ctx,
     });
     return jsonResponse({ error: 'Service unavailable' }, 503, cors);

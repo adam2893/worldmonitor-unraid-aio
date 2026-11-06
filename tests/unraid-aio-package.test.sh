@@ -27,6 +27,7 @@ for file in \
   require_file "$file"
 done
 
+require_text Dockerfile 'ENV VITE_SELF_HOSTED=true'
 require_text Dockerfile.unraid '# syntax=docker/dockerfile:1.7@sha256:'
 require_text Dockerfile.unraid 'ARG BASE_IMAGE'
 require_text Dockerfile.unraid 'org.opencontainers.image.source'
@@ -56,6 +57,7 @@ require_text docker/unraid/supervisord.conf '[program:worldmonitor-api]'
 require_text docker/unraid/supervisord.conf '[program:nginx]'
 require_text docker/unraid/supervisord.conf '[program:seed-scheduler]'
 require_text docker/unraid/entrypoint.sh '/config/secrets.env'
+require_text docker/unraid/entrypoint.sh 'export WORLDMONITOR_SELF_HOST_PRO=1'
 require_text docker/unraid/entrypoint.sh 'chmod 0600'
 require_text docker/unraid/entrypoint.sh 'must not be a symbolic link'
 require_absent docker/unraid/entrypoint.sh 'export RELAY_SHARED_SECRET REDIS_PASSWORD REDIS_TOKEN'

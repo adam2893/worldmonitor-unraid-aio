@@ -9,7 +9,7 @@ import {
   Bell, Brain, Key, Plug, PanelTop, ExternalLink,
   BarChart3, Clock, Radio, Ship, Plane, Flame,
   Cable, Wifi, MapPin, TrendingUp,
-  Filter, Lightbulb, SlidersHorizontal, Telescope,
+  Boxes, Filter, Lightbulb, SlidersHorizontal, Telescope,
   LineChart, Search, Shield, Building2,
   Landmark, Fuel
 } from 'lucide-react';
@@ -18,8 +18,9 @@ import { ensureClerk, tryResumeCheckoutFromUrl } from './services/checkout';
 import { scheduleClerkLoad, subscribeClerkLoaded } from './services/clerk';
 import { startClerkUserStateSync, type ClerkUserState } from './services/clerk-user-state';
 import { hasLiveClientSession } from './services/clerk-session';
+import { createTimeoutSignal, isTimeoutOrAbortError } from './services/timeout-signal';
 import { PricingSection } from './components/PricingSection';
-import { SoonBadge } from './components/SoonBadge';
+import { WhatsNew } from './components/WhatsNew';
 import { Logo } from './components/Logo';
 import { WiredBadge } from './components/WiredBadge';
 import { Footer } from './components/Footer';
@@ -29,12 +30,22 @@ import {
   DASHBOARD_SCREENSHOT_WEBP_SRCSET,
 } from './assets/dashboard-screenshot';
 import { ensureTurnstileScript } from './turnstile';
-import wiredLogo from './assets/wired-logo.svg';
+import { VoiceCards } from './components/Voices';
 import {
   DASHBOARD_EMBED_PREVIEW_URL,
   DASHBOARD_PATH,
   DASHBOARD_URL,
 } from './routes';
+import { appendStoredContentAttributionToUrl } from '../../shared/content-attribution';
+import { isInternalSourceTag } from '../../shared/referral-namespaces';
+import { readMcpAttributionFromSearch } from '../../shared/mcp-attribution';
+import { LegalFooterNav } from './components/LegalFooterNav';
+import { PressNav } from './components/PressNav';
+import { ABOUT_DOCS_PATH } from '../../shared/press';
+import {
+  isDesktopCheckoutHandoff,
+  parseMissionPreviewAttributionFromSearch,
+} from '../../shared/checkout-attribution';
 
 const API_BASE = 'https://api.worldmonitor.app/api';
 const TURNSTILE_SITE_KEY = '0x4AAAAAACnaYgHIyxclu8Tj';
@@ -67,9 +78,31 @@ export function renderTurnstileWidgets(): number {
   return count;
 }
 
+/**
+ * The single entry point for this page's inbound referral code. Every
+ * consumer goes through it — the dashboard CTAs via appendRefToUrl and
+ * PricingSection, which hands the value to startCheckout and from there to
+ * Dodo as `affonso_referral`.
+ *
+ * Internal source tags are rejected here rather than at each consumer: an
+ * internal tag is not an affiliate code on this surface either, and this page
+ * reaches checkout without ever passing through the dashboard's
+ * referral-capture guard (#6493).
+ */
 function getRefCode(): string | undefined {
+  if (typeof window === 'undefined') return undefined;
   const params = new URLSearchParams(window.location.search);
-  return params.get('ref') || undefined;
+  const code = params.get('ref') || undefined;
+  if (!code || isInternalSourceTag(code)) return undefined;
+  return code;
+}
+
+function getMcpAttributionSource(): string | undefined {
+  // Uses the shared allowlist rather than an inline literal so the /pro page,
+  // the checkout edge function, and the Convex webhook reader can never disagree
+  // about what the campaign marker is (#6716).
+  if (typeof window === 'undefined') return undefined;
+  return readMcpAttributionFromSearch(window.location.search);
 }
 
 /**
@@ -93,9 +126,20 @@ function isValidRefCode(code: string): boolean {
 }
 
 function appendRefToUrl(url: string, refCode: string | undefined): string {
-  if (!refCode || !isValidRefCode(refCode)) return url;
-  const sep = url.includes('?') ? '&' : '?';
-  return `${url}${sep}wm_referral=${encodeURIComponent(refCode)}`;
+  let nextUrl = appendStoredContentAttributionToUrl(url, {
+    destination: 'dashboard',
+    placement: 'pro-dashboard-cta',
+  });
+  if (!refCode || !isValidRefCode(refCode)) return nextUrl;
+  try {
+    const parsed = new URL(nextUrl, window.location.href);
+    parsed.searchParams.set('wm_referral', refCode);
+    nextUrl = parsed.toString();
+  } catch {
+    const sep = nextUrl.includes('?') ? '&' : '?';
+    nextUrl = `${nextUrl}${sep}wm_referral=${encodeURIComponent(refCode)}`;
+  }
+  return nextUrl;
 }
 
 function openSignIn(): void {
@@ -188,7 +232,7 @@ function ProEntitlementProvider({ children }: { children: ReactNode }): ReactEle
         }
         const resp = await fetch(`${API_BASE}/me/entitlement`, {
           headers: { Authorization: `Bearer ${token}` },
-          signal: AbortSignal.timeout(8_000),
+          signal: createTimeoutSignal(8_000),
         });
         if (!resp.ok) {
           if (!cancelled) setState({ isPro: false, isChecked: true });
@@ -198,7 +242,11 @@ function ProEntitlementProvider({ children }: { children: ReactNode }): ReactEle
         if (!cancelled) setState({ isPro: data.isPro === true, isChecked: true });
       } catch (err) {
         console.error('[auth] Failed to check pro entitlement:', err);
-        Sentry.captureException(err, { tags: { surface: 'pro-marketing', action: 'check-entitlement' } });
+        // WORLDMONITOR-10F: 8s createTimeoutSignal / page teardown aborts are
+        // expected (Safari: AbortError "Fetch is aborted"). Do not page Sentry.
+        if (!isTimeoutOrAbortError(err)) {
+          Sentry.captureException(err, { tags: { surface: 'pro-marketing', action: 'check-entitlement' } });
+        }
         if (!cancelled) setState({ isPro: false, isChecked: true });
       }
     })();
@@ -248,7 +296,7 @@ function ClerkUserButton({ user }: { user: UserResource | null }): ReactElement 
   }, [user]);
 
   return (
-    <div ref={ref} className="flex h-8 w-8 items-center justify-center">
+    <div ref={ref} translate="no" className="flex h-8 w-8 items-center justify-center">
       {!user && (
         <span
           className="block h-8 w-8 rounded-full border border-wm-border bg-wm-card shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]"
@@ -277,7 +325,7 @@ const Navbar = () => {
   // visitor who hasn't paid.
   const showGoToDashboard = isLoaded && signedIn && !!user && isChecked && isPro;
   return (
-    <nav className="fixed top-0 left-0 right-0 z-50 glass-panel border-b-0 border-x-0 rounded-none" aria-label="Main navigation">
+    <nav data-wm-nav="primary" className="fixed top-0 left-0 right-0 z-50 glass-panel border-b-0 border-x-0 rounded-none" aria-label="Main navigation">
       <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
         <Logo />
         <div className="hidden md:flex items-center gap-8 text-sm font-mono text-wm-muted">
@@ -300,7 +348,7 @@ const Navbar = () => {
             ))}
           {showGoToDashboard ? (
             <a
-              href={DASHBOARD_URL}
+              href={appendRefToUrl(DASHBOARD_URL, getRefCode())}
               className="bg-wm-green text-wm-bg px-4 py-2 rounded-sm font-mono text-xs uppercase tracking-wider font-bold hover:bg-green-400 transition-colors inline-flex items-center gap-1.5"
             >
               {t('nav.goToDashboard')} <ArrowRight className="w-3 h-3" aria-hidden="true" />
@@ -343,6 +391,18 @@ const SignalBars = () => {
           const scaleY = isSignal
             ? [0.5, 1, 0.65, 0.9]
             : [1, 0.3, 0.7, 0.15, 0.5];
+          // Motion accelerates `transform` but not the individual `scaleY`
+          // shorthand, so complete transform strings keep these 60 forever-
+          // repeating bars on the browser's compositor instead of Motion's
+          // JavaScript frame loop. Collapsing this back to `scaleY: [...]`
+          // looks identical and silently restores that main-thread cost.
+          const transform = scaleY.map((scale) => `scaleY(${scale})`);
+          // Motion's JS path expands a single `ease` into one easing per
+          // keyframe segment; its native path would apply a lone easing across
+          // the whole iteration and interpolate linearly between keyframes.
+          // Passing the array keeps the per-segment curve the bars had before,
+          // and still leaves the animation eligible for the native path.
+          const ease = scaleY.slice(1).map(() => 'easeInOut' as const);
 
           return (
             <div
@@ -359,14 +419,14 @@ const SignalBars = () => {
                     ? { boxShadow: `0 0 ${6 + signalIntensity * 12}px rgba(74,222,128,${signalIntensity * 0.5})` }
                     : null),
                 }}
-                initial={{ scaleY: initialScale, opacity: isSignal ? 0.4 : 0.08 }}
+                initial={{ transform: `scaleY(${initialScale})`, opacity: isSignal ? 0.4 : 0.08 }}
                 animate={isSignal
                   ? {
-                      scaleY,
+                      transform,
                       opacity: [0.6 + signalIntensity * 0.3, 1, 0.75 + signalIntensity * 0.2, 0.95],
                     }
                   : {
-                      scaleY,
+                      transform,
                       opacity: [0.2, 0.06, 0.15, 0.04, 0.12],
                     }
                 }
@@ -375,7 +435,7 @@ const SignalBars = () => {
                   repeat: Infinity,
                   repeatType: 'reverse',
                   delay: isSignal ? distFromCenter * 0.07 : jitter(i, 2) * 0.6,
-                  ease: 'easeInOut',
+                  ease,
                 }}
               />
             </div>
@@ -386,7 +446,7 @@ const SignalBars = () => {
   );
 };
 
-const Hero = () => {
+const Hero = ({ srLead }: { srLead?: string }) => {
   const { user, isLoaded, signedIn } = useClerkUser();
   const { isPro, isChecked } = useProEntitlement();
   // Showing "Sign In" to an already-signed-in user wastes a CTA slot.
@@ -402,8 +462,10 @@ const Hero = () => {
     <section className="pt-28 pb-12 px-6 relative overflow-hidden">
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_20%,rgba(74,222,128,0.08)_0%,transparent_50%)] pointer-events-none" />
       <div className="max-w-4xl mx-auto text-center relative z-10">
+        {/* The prerendered /pro HTML paints this hero before React mounts, so
+            an opacity:0 initial state would blank it out until the bundle ran. */}
         <motion.div
-          initial={{ opacity: 0, y: 20 }}
+          initial={false}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.6 }}
         >
@@ -412,6 +474,7 @@ const Hero = () => {
           </div>
 
           <h1 className="text-6xl md:text-8xl font-display font-bold tracking-tighter leading-[0.95]">
+            {srLead && <span className="sr-only">{srLead} </span>}
             <span className="text-wm-muted/40">{t('hero.noiseWord')}</span>
             <span className="mx-3 md:mx-5 text-wm-border/50">→</span>
             <span className="text-transparent bg-clip-text bg-gradient-to-r from-wm-green to-emerald-300 text-glow">{t('hero.signalWord')}</span>
@@ -425,7 +488,7 @@ const Hero = () => {
 
           <div className="flex flex-col sm:flex-row gap-3 justify-center mt-8">
             {showGoToDashboard ? (
-              <a href={DASHBOARD_URL} className="bg-wm-green text-wm-bg px-6 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:bg-green-400 transition-colors flex items-center justify-center gap-2">
+              <a href={appendRefToUrl(DASHBOARD_URL, getRefCode())} className="bg-wm-green text-wm-bg px-6 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:bg-green-400 transition-colors flex items-center justify-center gap-2">
                 {t('hero.goToDashboard')} <ArrowRight className="w-4 h-4" aria-hidden="true" />
               </a>
             ) : (
@@ -468,16 +531,9 @@ const SocialProof = () => (
           </div>
         ))}
       </div>
-      <blockquote className="max-w-3xl mx-auto text-center">
-        <p className="text-lg md:text-xl text-wm-muted italic leading-relaxed">
-          "{t('socialProof.quote')}"
-        </p>
-        <footer className="mt-6 flex items-center justify-center gap-3">
-          <a href="https://www.wired.com/story/world-monitor-elie-habib/" target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 text-wm-muted hover:text-wm-text transition-colors">
-            <img src={wiredLogo} alt="WIRED" loading="lazy" className="h-5 brightness-0 invert opacity-60 hover:opacity-100 transition-opacity" />
-          </a>
-        </footer>
-      </blockquote>
+      <h2 className="text-2xl md:text-3xl font-display font-bold mb-8 text-center">{t('welcome.voices.title')}</h2>
+      <VoiceCards />
+      <PressNav className="mt-6" />
     </div>
   </section>
 );
@@ -492,7 +548,7 @@ const TwoPathSplit = () => (
         <h3 className="font-display text-2xl font-bold mb-2">{t('twoPath.proTitle')}</h3>
         <p className="text-sm text-wm-muted mb-6">{t('twoPath.proDesc')}</p>
         <ul className="space-y-3 mb-8">
-          {[t('twoPath.proF1'), t('twoPath.proF2'), t('twoPath.proF3'), t('twoPath.proF4'), t('twoPath.proF5'), t('twoPath.proF6'), t('twoPath.proF7'), t('twoPath.proF8'), t('twoPath.proF9')].map((f, i) => (
+          {[t('twoPath.proF1'), t('twoPath.proF2'), t('twoPath.proF3'), t('twoPath.proF4'), t('twoPath.proF5'), t('twoPath.proF6'), t('twoPath.proF7'), t('twoPath.proF8'), t('twoPath.proF9'), t('twoPath.proF10')].map((f, i) => (
             <li key={i} className="flex items-start gap-3 text-sm">
               <Check className="w-4 h-4 shrink-0 mt-0.5 text-wm-green" aria-hidden="true" />
               <span className="text-wm-muted">{f}</span>
@@ -734,13 +790,10 @@ const ProShowcase = () => (
             </div>
           </div>
           <div className="flex gap-4">
-            <Telescope className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
+            <Boxes className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
             <div>
-              <h4 className="font-bold mb-1">
-                {t('proShowcase.orbitalSurveillance')}
-                <SoonBadge />
-              </h4>
-              <p className="text-sm text-wm-muted">{t('proShowcase.orbitalSurveillanceDesc').replace(/^\(Soon\)\s*/, '')}</p>
+              <h4 className="font-bold mb-1">{t('proShowcase.supplyChainLab')}</h4>
+              <p className="text-sm text-wm-muted">{t('proShowcase.supplyChainLabDesc')}</p>
             </div>
           </div>
           <div className="flex gap-4">
@@ -759,6 +812,8 @@ const ProShowcase = () => (
           </div>
         </div>
 
+        <p className="mt-6 text-xs text-wm-muted">{t('proShowcase.roadmapNote')}</p>
+
         <div className="mt-10 pt-8 border-t border-wm-border">
           <p className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-4">{t('proShowcase.deliveryLabel')}</p>
           <div className="flex gap-6">
@@ -771,7 +826,7 @@ const ProShowcase = () => (
             ].map((ch, i) => (
               <div key={i} className="flex flex-col items-center gap-1.5 text-wm-muted hover:text-wm-text transition-colors cursor-pointer">
                 {ch.icon}
-                <span className="text-[10px] font-mono">{ch.label}</span>
+                <span className="text-xs font-mono">{ch.label}</span>
               </div>
             ))}
           </div>
@@ -855,7 +910,7 @@ const AudiencePersonas = () => {
 const ApiSection = () => (
   <section className="py-24 px-6 border-y border-wm-border bg-[#0a0a0a]" id="api">
     <div className="max-w-7xl mx-auto grid lg:grid-cols-2 gap-16 items-center">
-      <div className="order-2 lg:order-1">
+      <div className="order-2 lg:order-1 min-w-0">
         <div className="bg-black border border-wm-border rounded-lg overflow-hidden font-mono text-sm">
           <div className="bg-wm-card px-4 py-2 border-b border-wm-border flex items-center gap-2">
             <Terminal className="w-4 h-4 text-wm-muted" aria-hidden="true" />
@@ -882,7 +937,7 @@ const ApiSection = () => (
         </div>
       </div>
 
-      <div className="order-1 lg:order-2">
+      <div className="order-1 lg:order-2 min-w-0">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-wm-border bg-wm-card text-wm-muted text-xs font-mono mb-6">
           {t('apiSection.apiTier')}
         </div>
@@ -1024,13 +1079,16 @@ const EnterpriseShowcase = () => (
 /* ─── 11. Comparison Table (simplified columns, kept technical rows) ─── */
 const PricingTable = () => {
   const rows = [
-    { feature: t('pricingTable.dataRefresh'), free: t('pricingTable.f5_15min'), pro: t('pricingTable.fLt60s'), api: t('pricingTable.fPerRequest'), ent: t('pricingTable.fLiveEdge') },
-    { feature: t('pricingTable.dashboard'), free: t('pricingTable.f50panels'), pro: t('pricingTable.f50panels'), api: "\u2014", ent: t('pricingTable.fWhiteLabel') },
+    { feature: t('pricingTable.dataRefresh'), free: t('pricingTable.fStandardCadence'), pro: t('pricingTable.fQuotes30s'), api: t('pricingTable.fPerRequest'), ent: t('pricingTable.fLiveEdge') },
+    { feature: t('pricingTable.panelsRow'), free: t('pricingTable.f40'), pro: t('pricingTable.fUnlimited'), api: t('pricingTable.fUnlimited'), ent: t('pricingTable.fWhiteLabel') },
+    { feature: t('pricingTable.tabsRow'), free: t('pricingTable.f3'), pro: t('pricingTable.f10'), api: t('pricingTable.f25'), ent: t('pricingTable.fUnlimited') },
+    { feature: t('pricingTable.sourcesRow'), free: t('pricingTable.f80'), pro: t('pricingTable.fAll'), api: t('pricingTable.fAll'), ent: t('pricingTable.fAll') },
+    { feature: t('pricingTable.followedRow'), free: t('pricingTable.f3'), pro: t('pricingTable.fUnlimited'), api: t('pricingTable.fUnlimited'), ent: t('pricingTable.fUnlimited') },
     { feature: t('pricingTable.ai'), free: t('pricingTable.fBYOK'), pro: t('pricingTable.fIncluded'), api: "\u2014", ent: t('pricingTable.fAgentsPersonas') },
     { feature: t('pricingTable.briefsAlerts'), free: "\u2014", pro: t('pricingTable.fDailyFlash'), api: "\u2014", ent: t('pricingTable.fTeamDist') },
     { feature: t('pricingTable.delivery'), free: "\u2014", pro: t('pricingTable.fSlackTgWa'), api: t('pricingTable.fWebhook'), ent: t('pricingTable.fSiemMcp') },
     { feature: t('pricingTable.apiRow'), free: "\u2014", pro: "\u2014", api: t('pricingTable.fRestWebhook'), ent: t('pricingTable.fMcpBulk') },
-    { feature: t('pricingTable.infraLayers'), free: t('pricingTable.f50plus'), pro: t('pricingTable.f50plus'), api: "\u2014", ent: t('pricingTable.fTensOfThousands') },
+    { feature: t('pricingTable.infraLayers'), free: t('pricingTable.fLayersNoResilience'), pro: t('pricingTable.fAllLayers'), api: t('pricingTable.fAllLayers'), ent: t('pricingTable.fTensOfThousands') },
     { feature: t('pricingTable.satellite'), free: t('pricingTable.fLiveTracking'), pro: t('pricingTable.fPassAlerts'), api: "\u2014", ent: t('pricingTable.fImagerySar') },
     { feature: t('pricingTable.connectorsRow'), free: "\u2014", pro: "\u2014", api: "\u2014", ent: t('pricingTable.f100plus') },
     { feature: t('pricingTable.deployment'), free: t('pricingTable.fCloud'), pro: t('pricingTable.fCloud'), api: t('pricingTable.fCloud'), ent: t('pricingTable.fCloudOnPrem') },
@@ -1064,7 +1122,7 @@ const PricingTable = () => {
         {rows.map((row, i) => (
           <div key={i} className="bg-wm-card border border-wm-border p-4 rounded-sm">
             <p className="font-medium text-sm mb-3">{row.feature}</p>
-            <div className="grid grid-cols-2 gap-2 text-xs">
+            <div className="grid grid-cols-2 gap-2 text-xs break-words">
               <div><span className="text-wm-muted">{t('tiers.free')}:</span> {row.free}</div>
               <div><span className="text-wm-green">{t('tiers.pro')}:</span> <span className="text-wm-green">{row.pro}</span></div>
               <div><span className="text-wm-muted">{t('nav.api')}:</span> {row.api}</div>
@@ -1121,9 +1179,9 @@ const FAQ = () => {
 /* ─── Enterprise Page (dedicated /pro/#enterprise) ─── */
 const EnterprisePage = () => (
   <div className="min-h-screen selection:bg-wm-green/30 selection:text-wm-green">
-    <nav className="fixed top-0 left-0 right-0 z-50 glass-panel border-b-0 border-x-0 rounded-none" aria-label="Main navigation">
+    <nav data-wm-nav="primary" className="fixed top-0 left-0 right-0 z-50 glass-panel border-b-0 border-x-0 rounded-none" aria-label="Main navigation">
       <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-        <a href="#" onClick={(e) => { e.preventDefault(); window.location.hash = ''; }}><Logo /></a>
+        <Logo href="#" onClick={(e) => { e.preventDefault(); window.location.hash = ''; }} />
         <div className="hidden md:flex items-center gap-8 text-sm font-mono text-wm-muted">
           <a href="#" onClick={(e) => { e.preventDefault(); window.location.hash = ''; }} className="hover:text-wm-text transition-colors">{t('nav.pro')}</a>
           <a href="#enterprise" onClick={(e) => { e.preventDefault(); document.getElementById('features')?.scrollIntoView({ behavior: 'smooth' }); }} className="hover:text-wm-text transition-colors">{t('nav.enterprise')}</a>
@@ -1249,6 +1307,7 @@ const EnterprisePage = () => (
             }
             try {
               const res = await fetch(`${API_BASE}/leads/v1/submit-contact`, {
+                signal: createTimeoutSignal(60_000),
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1312,51 +1371,63 @@ const EnterprisePage = () => (
       <div className="flex flex-col md:flex-row items-center justify-between max-w-7xl mx-auto text-xs text-wm-muted font-mono">
         <div className="flex items-center gap-3 mb-4 md:mb-0">
           <img src="/favico/favicon-32x32.png" alt="" width="28" height="28" loading="lazy" className="rounded-full" />
-          <div className="flex flex-col">
-            <span className="font-display font-bold text-sm leading-none tracking-tight text-wm-text">WORLD MONITOR</span>
-            <span className="text-[9px] uppercase tracking-[2px] opacity-60 mt-0.5">by Someone.ceo</span>
-          </div>
+          <span className="font-display font-bold text-sm leading-none tracking-tight text-wm-text">WORLD MONITOR</span>
         </div>
         <div className="flex items-center gap-6">
           <a href={DASHBOARD_PATH} className="hover:text-wm-text transition-colors">Dashboard</a>
+          <a href={ABOUT_DOCS_PATH} className="hover:text-wm-text transition-colors">About</a>
           <a href="https://www.worldmonitor.app/blog/" className="hover:text-wm-text transition-colors">Blog</a>
-          <a href="https://www.worldmonitor.app/docs" className="hover:text-wm-text transition-colors">Docs</a>
+          <a href="https://www.worldmonitor.app/docs/documentation" className="hover:text-wm-text transition-colors">Docs</a>
           <a href="https://status.worldmonitor.app/" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">Status</a>
           <a href="https://github.com/koala73/worldmonitor" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">GitHub</a>
-          <a href="https://discord.gg/re63kWKxaz" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">Discord</a>
-          <a href="https://x.com/worldmonitorai" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">X</a>
+          <a href="https://x.com/worldmonitorai" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">X (Twitter)</a>
         </div>
-        <span className="text-[10px] opacity-40 mt-4 md:mt-0">&copy; {new Date().getFullYear()} WorldMonitor</span>
+        <span className="text-xs opacity-40 mt-4 md:mt-0">&copy; {new Date().getFullYear()} WorldMonitor</span>
       </div>
+      <PressNav />
+      {/* This is the pricing page — the footer a buyer sees on the way to
+          checkout — so the documents they are agreeing to have to be one click
+          from here, not one FAQ answer deep (#6976). */}
+      <LegalFooterNav />
     </footer>
   </div>
 );
 
 /* ─── Page Layout ─── */
+/**
+ * The home page's first viewport and landmark structure. prerender.mjs renders
+ * it to static HTML (pro-first-viewport-prerender.tsx) so the hero paints, at
+ * its final size, before the bundle mounts and replaces #root.
+ */
+export const ProHomeShell = ({ heroSrLead, footer, children }: {
+  heroSrLead?: string;
+  footer?: ReactNode;
+  children: ReactNode;
+}) => (
+  <div className="min-h-screen selection:bg-wm-green/30 selection:text-wm-green">
+    <Navbar />
+    <main>
+      <Hero srLead={heroSrLead} />
+      {children}
+    </main>
+    {footer}
+  </div>
+);
+
 export default function App() {
   const [page, setPage] = useState(() => window.location.hash.startsWith('#enterprise') ? 'enterprise' : 'home');
 
-  // Initialize Dodo checkout overlay with success handler.
+  // Resume a checkout the buyer started before signing in.
   //
-  // On overlay success, the buyer needs to be bridged from /pro to the
-  // main dashboard where their newly-minted entitlement actually
-  // unlocks panels. Two changes vs the original 3-second blind reload:
-  //
-  //   1. Explicit "Go to dashboard now →" button so engaged buyers
-  //      don't wait out the auto-redirect timer.
-  //   2. Auto-redirect is 1500ms (down from 3000ms) — fast enough to
-  //      feel responsive without clipping the confirmation reading time.
-  //   3. Redirect target carries `?wm_checkout=success` so the dashboard
-  //      side (handleCheckoutReturn in src/services/checkout-return.ts)
-  //      recognizes this as a post-purchase landing and triggers the
-  //      extended-unlock banner from PR-4, instead of rendering a
-  //      default dashboard with no context.
+  // This mount hook used to also call `initOverlay()`, which dynamically
+  // imported the heavy Dodo overlay SDK on every /pro mount and registered an
+  // overlay-success handler that bridged the buyer to the dashboard. #4449
+  // moved checkout to a top-level redirect to Dodo's hosted page (see
+  // startCheckout), which made that handler unreachable — after payment the
+  // buyer lands on the dashboard, not /pro, and handleCheckoutReturn owns that
+  // UX via the guarded `?wm_checkout=return` contract. #7222 deleted the
+  // function and dropped `dodopayments-checkout` from this bundle.
   useEffect(() => {
-    // #4449: the Dodo overlay is no longer used — checkout redirects top-level
-    // to the hosted page (see startCheckout). We no longer call initOverlay(),
-    // which dynamically imported the heavy Dodo overlay SDK on /pro mount and
-    // registered a success banner that can never fire (after payment the buyer
-    // lands on the dashboard, not /pro — handleCheckoutReturn owns that UX).
     // Consume checkout intent from URL (set by afterSignInUrl on the
     // checkout-initiated sign-in). No-op for any other /pro entry
     // point; strips params before any await so a reload can't re-fire.
@@ -1380,6 +1451,20 @@ export default function App() {
     return () => window.removeEventListener('hashchange', onHash);
   }, [page]);
 
+  // Deep links into the home page (/pro#pricing from every dashboard
+  // "Upgrade to Pro" CTA) target React-only sections that are absent from the
+  // prerendered HTML, so the browser's native fragment scroll runs before the
+  // target exists and leaves the buyer at the top of the page. Scroll once
+  // the section has mounted. The rAF lets layout settle first.
+  useEffect(() => {
+    const hash = window.location.hash;
+    if (hash.length < 2 || hash.startsWith('#enterprise')) return;
+    const frame = requestAnimationFrame(() => {
+      document.getElementById(hash.slice(1))?.scrollIntoView();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
   useEffect(() => {
     if (page === 'enterprise' && window.location.hash === '#enterprise-contact') {
       setTimeout(() => {
@@ -1392,27 +1477,28 @@ export default function App() {
 
   return (
     <ProEntitlementProvider>
-      <div className="min-h-screen selection:bg-wm-green/30 selection:text-wm-green">
-        <Navbar />
-        <main>
-          <Hero />
-          <SourceMarquee />
-          <Pillars />
-          <WhyUpgrade />
-          <TwoPathSplit />
-          <ProShowcase />
-          <DeliveryDesk />
-          <AudiencePersonas />
-          <SocialProof />
-          <LivePreview />
-          <PricingSection refCode={getRefCode()} />
-          <PricingTable />
-          <ApiSection />
-          <EnterpriseShowcase />
-          <FAQ />
-        </main>
-        <Footer />
-      </div>
+      <ProHomeShell footer={<Footer />}>
+        <SourceMarquee />
+        <Pillars />
+        <WhyUpgrade />
+        <SocialProof />
+        <TwoPathSplit />
+        <ProShowcase />
+        <DeliveryDesk />
+        <AudiencePersonas />
+        <LivePreview />
+        <WhatsNew />
+        <PricingSection
+          refCode={getRefCode()}
+          attributionSource={getMcpAttributionSource()}
+          checkoutAttribution={parseMissionPreviewAttributionFromSearch(window.location.search) ?? undefined}
+          desktopHandoff={isDesktopCheckoutHandoff(window.location.search)}
+        />
+        <PricingTable />
+        <ApiSection />
+        <EnterpriseShowcase />
+        <FAQ />
+      </ProHomeShell>
     </ProEntitlementProvider>
   );
 }

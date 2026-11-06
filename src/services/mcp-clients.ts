@@ -1,3 +1,4 @@
+import { createTimeoutSignal } from '@/services/timeout-signal';
 /**
  * Frontend service for the Connected MCP clients tab (plan 2026-05-10-001 U9).
  *
@@ -14,8 +15,16 @@
  *     of truth — no client-side enforcement, just display).
  */
 
-import { getConvexClient, getConvexApi, waitForConvexAuth } from './convex-client';
-import { getClerkToken } from './clerk';
+import {
+  getConvexClient,
+  getConvexApi,
+  waitForConvexAuthForUser,
+} from './convex-client';
+import { getClerkToken, getCurrentClerkUser } from './clerk';
+import {
+  assertAccountStillCurrent,
+  settleAccountOperation,
+} from './account-operation';
 
 export interface McpClientInfo {
   id: string;
@@ -27,23 +36,33 @@ export interface McpClientInfo {
 
 export interface McpQuota {
   used: number;
-  limit: number;
+  /** Plan-resolved daily allowance. `null` = unlimited (plan 2026-07-25-001 U3b). */
+  limit: number | null;
   resetsAt: string;
 }
 
 /** List all Pro MCP tokens for the current user. */
 export async function listMcpClients(): Promise<McpClientInfo[]> {
-  const client = await getConvexClient();
-  const api = await getConvexApi();
-  if (!client || !api) return [];
+  const userId = getCurrentClerkUser()?.id;
+  if (!userId) return [];
 
-  await waitForConvexAuth();
+  const [client, api] = await Promise.all([getConvexClient(), getConvexApi()]);
+  if (!client || !api) return [];
+  if (!await waitForConvexAuthForUser(userId)) {
+    assertAccountStillCurrent(userId, 'loading MCP clients');
+    throw new Error('Authentication unavailable while loading MCP clients. Try again.');
+  }
 
   // Mirror services/api-keys.ts:listApiKeys cast pattern — the generated
   // Convex `api` is fully typed at module level but each service casts
   // `as any` at the call-site to avoid pulling the entire generated index
   // type into every service file.
-  const rows = await client.query((api as any).mcpProTokens.listProMcpTokens, {});
+  const rows = await settleAccountOperation(
+    userId,
+    'loading MCP clients',
+    () => client.query((api as any).mcpProTokens.listProMcpTokens, {}),
+  );
+  assertAccountStillCurrent(userId, 'loading MCP clients');
   return rows as McpClientInfo[];
 }
 
@@ -59,6 +78,8 @@ export async function revokeMcpClient(tokenId: string): Promise<void> {
   if (!token) throw new Error('Sign in to revoke MCP clients.');
 
   const resp = await fetch('/api/user/mcp-revoke', {
+
+    signal: createTimeoutSignal(15_000),
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -85,40 +106,41 @@ export async function revokeMcpClient(tokenId: string): Promise<void> {
 }
 
 /**
- * Fetch the caller's daily Pro MCP quota usage. Returns sane defaults on
- * any failure — the settings UI is informational and should never break
- * because the quota counter is unreachable.
+ * Fetch the caller's daily Pro MCP quota usage. Reject unavailable or malformed
+ * reads so the settings UI can distinguish them from a successful zero.
  */
 export async function fetchMcpQuota(): Promise<McpQuota> {
-  const fallback: McpQuota = { used: 0, limit: 50, resetsAt: nextUtcMidnightIso() };
-
   const token = await getClerkToken();
-  if (!token) return fallback;
+  if (!token) throw new Error('Quota unavailable');
 
-  try {
-    const resp = await fetch('/api/user/mcp-quota', {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!resp.ok) return fallback;
-    const data = (await resp.json()) as Partial<McpQuota>;
-    return {
-      used: typeof data.used === 'number' && data.used >= 0 ? data.used : 0,
-      limit: typeof data.limit === 'number' && data.limit > 0 ? data.limit : 50,
-      resetsAt: typeof data.resetsAt === 'string' ? data.resetsAt : fallback.resetsAt,
-    };
-  } catch {
-    return fallback;
+  const resp = await fetch('/api/user/mcp-quota', {
+
+    signal: createTimeoutSignal(15_000),
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) throw new Error('Quota unavailable');
+  const data = (await resp.json()) as Partial<McpQuota> | null;
+  if (!data
+    || typeof data.used !== 'number' || !Number.isFinite(data.used) || data.used < 0
+    || (data.limit !== null && (typeof data.limit !== 'number' || !Number.isFinite(data.limit) || data.limit < 0))
+    || typeof data.resetsAt !== 'string' || !Number.isFinite(Date.parse(data.resetsAt))) {
+    throw new Error('Quota unavailable');
   }
+  return { used: data.used, limit: normalizeQuotaLimit(data.limit), resetsAt: data.resetsAt };
 }
 
-function nextUtcMidnightIso(): string {
-  const now = new Date();
-  const next = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate() + 1,
-    0, 0, 0, 0,
-  ));
-  return next.toISOString();
+/**
+ * `null` is a real value on the wire — the plan is unlimited — so it must
+ * survive normalisation instead of collapsing into the 50/day fallback. `0` is
+ * likewise a real allowance, not a missing one. Anything else (absent field,
+ * malformed type, negative) falls back to the plan default.
+ *
+ * Exported so tests/mcp-quota.test.mjs can pin the client end of the same wire
+ * contract the endpoint's own cases pin: a truthiness check here would put
+ * "50 / 50" back in front of an unlimited caller.
+ */
+export function normalizeQuotaLimit(raw: McpQuota['limit'] | undefined): number | null {
+  if (raw === null) return null;
+  return typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : 50;
 }

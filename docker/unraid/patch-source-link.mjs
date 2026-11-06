@@ -17,8 +17,12 @@ async function walk(path) {
     }
     const dot = entry.lastIndexOf('.');
     if (dot < 0 || !extensions.has(entry.slice(dot))) continue;
+    const ext = entry.slice(dot);
     const before = await readFile(child, 'utf8');
-    const after = before.replaceAll(upstream, source);
+    let after = before.replaceAll(upstream, source);
+    if (ext === '.html' && after.includes('<head>') && !after.includes('__WM_SELF_HOSTED__')) {
+      after = after.replace('<head>', '<head><script>window.__WM_SELF_HOSTED__=true;</script>');
+    }
     if (after !== before) {
       replacements += before.split(upstream).length - 1;
       await writeFile(child, after);
