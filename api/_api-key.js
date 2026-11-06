@@ -159,5 +159,10 @@ export async function validateApiKey(req, options = {}) {
   // authority is also present.
   if (testerCookies.length) return { valid: false, required: true, error: 'Invalid API key' };
 
+  const selfHostPro = (process.env.WORLDMONITOR_SELF_HOST_PRO || '').trim().toLowerCase();
+  if (selfHostPro === '1' || selfHostPro === 'true') {
+    return { valid: true, required: false, kind: 'enterprise' };
+  }
+
   return { valid: false, required: true, error: 'API key required' };
 }
