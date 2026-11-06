@@ -94,6 +94,7 @@
       "scripts/shared/product-catalog.generated.json",
       "scripts/shared/rss-allowed-domains.cjs",
       "scripts/shared/rss-allowed-domains.json",
+      "scripts/shared/runtime-endpoints.cjs",
       "scripts/shared/source-tier-policy.cjs",
       "scripts/shared/source-tiers.json",
       "scripts/shared/x-account-source-tiers.json",

@@ -1,6 +1,6 @@
 # Third-party notices for World Monitor Unraid AIO
 
-This image is an unofficial aggregate distribution. The complete corresponding source for the modified World Monitor image is published at <https://github.com/imzenreally/worldmonitor-unraid-aio> and the upstream project remains at <https://github.com/koala73/worldmonitor>.
+This image is an unofficial aggregate distribution. The complete corresponding source for the modified World Monitor image is published at [https://github.com/adam2893/worldmonitor-unraid-aio](https://github.com/adam2893/worldmonitor-unraid-aio) and the upstream project remains at [https://github.com/koala73/worldmonitor](https://github.com/koala73/worldmonitor).
 
 The release workflow generates and attests an SPDX SBOM for the exact published digest. That SBOM is the authoritative package-level inventory. The following table identifies the principal runtime components and their upstream license families.
 

@@ -8,10 +8,13 @@ const workflow = readFileSync(
 );
 
 describe('live API cache/auth workflow policy', () => {
-  it('is manual-only in the downstream Unraid fork', () => {
-    assert.doesNotMatch(workflow, /^\s*schedule:/m);
+  it('skips scheduled sweeps in the downstream Unraid fork', () => {
     assert.doesNotMatch(workflow, /^\s*push:/m);
     assert.match(workflow, /^\s*workflow_dispatch:/m);
+    assert.match(
+      workflow,
+      /github\.event_name != 'schedule' \|\| github\.repository == 'koala73\/worldmonitor'/,
+    );
   });
 
   it('retains the deliberate production diagnostic', () => {

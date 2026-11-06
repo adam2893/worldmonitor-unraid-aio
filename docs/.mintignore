@@ -58,3 +58,8 @@ zh/.translation-spec.md
 
 # Engineering audit receipt; not product documentation.
 outbound-resilience-audit.md
+
+# Unraid AIO downstream fork packaging docs.
+THIRD_PARTY_NOTICES.md
+UNRAID.md
+UNRAID_API_KEYS.md

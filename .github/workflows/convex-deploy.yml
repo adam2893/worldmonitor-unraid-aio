@@ -63,6 +63,7 @@ jobs:
     # test.yml's there. Not gated itself — deploy-gate.yml only aggregates Test,
     # Typecheck, Lint Code, Security Audit and Stacked Merge Guard.
     name: convex-changes
+    if: github.repository == 'koala73/worldmonitor'
     runs-on: ubuntu-latest
     outputs:
       convex: ${{ steps.diff.outputs.convex }}

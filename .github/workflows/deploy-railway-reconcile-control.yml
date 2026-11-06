@@ -24,6 +24,7 @@ concurrency:
 jobs:
   unit-test:
     name: Unit tests
+    if: github.repository == 'koala73/worldmonitor'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:

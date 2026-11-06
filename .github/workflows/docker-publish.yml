@@ -110,7 +110,7 @@ jobs:
     # run this scheduled build on its own schedule; push, release and manual
     # runs in a fork are left alone (tests/ci-workflow-coverage.test.mts pins
     # the guard on every job of a scheduled workflow).
-    if: (github.event_name != 'schedule' || github.repository == 'koala73/worldmonitor')
+    if: github.repository == 'koala73/worldmonitor' && (github.event_name != 'schedule' || github.repository == 'koala73/worldmonitor')
     runs-on: ubuntu-latest
     # A multi-platform build under QEMU is slow enough that a hang is
     # plausible, and this job holds the `docker-publish` concurrency slot while
